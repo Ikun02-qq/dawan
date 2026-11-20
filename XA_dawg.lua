@@ -24222,6 +24222,19 @@ local __addPresetUI = function()
     end
     -- 事件监听：谁被点过就记下来（不依赖加载顺序/时序）
     local __clicked = {}
+    -- 初始状态快照：预设面板创建时记录一次
+    -- 保存时只记「和初始不同」的，默认开启的不会被算进去
+    local __initial = {}
+    do
+        for _, inst in ipairs(gui:GetDescendants()) do
+            if inst.Name == "ToggleModule" then
+                local b = inst:FindFirstChild("ToggleBtn")
+                local dis = b and b:FindFirstChild("ToggleDisable")
+                local sw = dis and dis:FindFirstChild("ToggleSwitch")
+                if b and sw then __initial[b] = (sw.Position.X.Offset > 0) end
+            end
+        end
+    end
     local function hookOne(b)
         if not b or b:GetAttribute("__dawgTracked") then return end
         b:SetAttribute("__dawgTracked", true)
@@ -24255,9 +24268,22 @@ local __addPresetUI = function()
                 local sw = dis and dis:FindFirstChild("ToggleSwitch")
                 if b and sw then
                     idx = idx + 1
+                    local secName = ""
+                    local secObj = inst.Parent and inst.Parent.Parent
+                    if secObj then
+                        for _, d2 in ipairs(secObj:GetChildren()) do
+                            if d2.Name == "SectionText" then
+                                secName = (tostring(d2.Text):gsub("^%s+", ""))
+                                break
+                            end
+                        end
+                    end
+                    local txtName = (tostring(b.Text):gsub("^%s+", ""))
                     table.insert(list, {
                         idx = idx, btn = b,
-                        text = (tostring(b.Text):gsub("^%s+", "")),
+                        text = txtName,
+                        section = secName,
+                        key = secName .. "|" .. txtName,
                         on = (sw.Position.X.Offset > 0),
                         touched = __clicked[b] == true,
                         mine = (inst:GetAttribute("DawgLZ") ~= nil) or (inst:GetAttribute("DawgGPS") == true),
@@ -24276,38 +24302,49 @@ local __addPresetUI = function()
             pcall(function() firesignal(btn.MouseButton1Click) end)
             return
         end
-        task.spawn(function()
-            local dis = btn:FindFirstChild("ToggleDisable")
-            local sw = dis and dis:FindFirstChild("ToggleSwitch")
-            local before = sw and sw.Position.X.Offset
-            for _, c in ipairs(conns) do
-                pcall(function() c:Fire() end)
-                task.wait(0.03)
-                if sw and sw.Position.X.Offset ~= before then break end
-            end
-        end)
+        -- 同步执行（不能 async，否则调用方等不到结果）
+        local dis = btn:FindFirstChild("ToggleDisable")
+        local sw = dis and dis:FindFirstChild("ToggleSwitch")
+        local before = sw and sw.Position.X.Offset
+        -- 逐个触发，状态一变就停：
+        -- 多触发会撞上 XA 的 autoRetry（延迟递归全触发）+ 自己 toggle 的 enabled 取反，导致开→关抵消
+        for _, c in ipairs(conns) do
+            pcall(function() c:Fire() end)
+            task.wait(0.12)
+            if sw and sw.Position.X.Offset ~= before then break end
+        end
     end
     local function apply(entry)
-        local wantOn, wantIdx = {}, {}
-        for _, txt in ipairs(entry.onText or {}) do wantOn[txt] = true end
-        for _, i in ipairs(entry.on or {}) do wantIdx[i] = true end
+        -- 新格式用「分类|名字」精确匹配；旧格式只匹配当前唯一的纯名字
+        local wantKey, oldNames = {}, {}
+        for _, txt in ipairs(entry.onText or {}) do
+            if txt:find("|", 1, true) then
+                wantKey[txt] = true
+            else
+                oldNames[txt] = (oldNames[txt] or 0) + 1
+            end
+        end
+        local nameCount = {}
+        for _, t in ipairs(collect()) do
+            nameCount[t.text] = (nameCount[t.text] or 0) + 1
+        end
 
         local n = 0
         for _, t in ipairs(collect()) do
-            local txt = t.text or ""
             local shouldOn = false
             if not t.mine then
-                if txt ~= "" and wantOn[txt] then
+                if t.key and wantKey[t.key] then
                     shouldOn = true
-                elseif entry.onText == nil and wantIdx[t.idx] then
-                    shouldOn = true   -- 旧预设兜底
+                elseif t.text and oldNames[t.text] and nameCount[t.text] == 1 then
+                    shouldOn = true
+                elseif entry.onText == nil and entry.on and wantIdx and wantIdx[t.idx] then
+                    shouldOn = true
                 end
             end
-            -- 只打开，不关闭（默认开启的不受影响）
             if shouldOn and not t.on then
                 clickT(t.btn)
                 n = n + 1
-                task.wait(0.12)
+                task.wait(0.18)
             end
         end
         -- 第二套：恢复新功能开关（按标记精确匹配）
@@ -24423,12 +24460,23 @@ local __addPresetUI = function()
             if txt ~= "" then
                 -- 我们的开关：开着就记（不看点没点过）
                 -- 原有开关：点过才记
-                local changed = (t.mine and t.on) or (__clicked[t.btn] == true)
+                local init = __initial[t.btn]
+                local changed = false
+                if t.mine then
+                    -- 我们的开关：开着就记
+                    changed = t.on
+                elseif init ~= nil and t.on ~= init then
+                    -- 状态和初始不同 → 用户改过
+                    changed = true
+                elseif init == nil and __clicked[t.btn] == true then
+                    -- 没快照的（新出现的开关）只能靠点击记录
+                    changed = true
+                end
                 if changed then
                     changedCount = changedCount + 1
                     if t.on then
                         table.insert(on, t.idx)
-                        table.insert(onText, txt)
+                        table.insert(onText, t.key or txt)
                     end
                 end
             end
@@ -25653,22 +25701,58 @@ end)
 local baseFov = nil
 local zoomOn = false
 local zoomArmedRef = nil
+local zoomWanted = false   -- 用户想要的缩放状态（复活后要保持）
+
+--- 记录基准 FOV
+--- 关键：只在「没用放大」的时候记，否则会把放大后的值当成基准，
+---       下次按住 min(zoomFov, baseFov) 就变成没变化 → 看起来像"放大功能断了"
+local function captureBaseFov()
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local fov = cam.FieldOfView
+	-- 当前 FOV 已经接近放大值 → 不要记，会污染基准
+	if fov <= (CFG.zoomFov or 10) + 8 then
+		return
+	end
+	baseFov = fov
+end
+
+--- 延迟记录基准（等相机稳定）
+local function captureBaseFovDelayed(delay)
+	task.spawn(function()
+		task.wait(delay or 1.5)
+		captureBaseFov()
+	end)
+end
+
+-- 启动时记录一次
+captureBaseFovDelayed(1)
+
+-- 角色重生后重新记录（等复活过场跑完）
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+LP.CharacterAdded:Connect(function()
+	-- 复活后相机 FOV 会被重置，等 2 秒再记
+	captureBaseFovDelayed(2)
+	-- 如果之前是开启状态，复活后重新武装
+	if zoomWanted then
+		zoomOn = true
+		if zoomArmedRef then zoomArmedRef(true) end
+	end
+end)
 
 local function applyZoom(on)
 	local cam = workspace.CurrentCamera
 	if not cam then return end
-	if baseFov == nil then baseFov = cam.FieldOfView end
+	if baseFov == nil then captureBaseFov() end
 	zoomOn = on
+	zoomWanted = on
 	if zoomArmedRef then zoomArmedRef(on) end
-	if on then
-		-- 开启：记录当前 FOV 作为基准，不立即放大
-		baseFov = cam.FieldOfView
-	else
+	if not on then
 		-- 关闭：恢复到基准
 		if baseFov then
 			TweenService:Create(cam, TweenInfo.new(CFG.zoomTween, Enum.EasingStyle.Quad), { FieldOfView = baseFov }):Play()
 		end
-		baseFov = nil
 	end
 end
 
@@ -25700,8 +25784,11 @@ UIS.InputBegan:Connect(function(input, gp)
 		rmbDown = true
 		if zoomArmed then
 			local cam = workspace.CurrentCamera
-			if cam and baseFov then
-				TweenService:Create(cam, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { FieldOfView = math.max(4, math.min(CFG.zoomFov, baseFov)) }):Play()
+			if cam then
+				if not baseFov then captureBaseFov() end
+				if baseFov then
+					TweenService:Create(cam, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { FieldOfView = math.max(4, math.min(CFG.zoomFov, baseFov)) }):Play()
+				end
 			end
 		end
 	end
@@ -25709,9 +25796,9 @@ end)
 UIS.InputEnded:Connect(function(input)
 	if isZoomModInput(input) then
 		rmbDown = false
-		if zoomArmed and baseFov then
+		if zoomArmed then
 			local cam = workspace.CurrentCamera
-			if cam then
+			if cam and baseFov then
 				TweenService:Create(cam, TweenInfo.new(0.15, Enum.EasingStyle.Quad), { FieldOfView = baseFov }):Play()
 			end
 		end
@@ -26107,102 +26194,86 @@ GENV.__MAPLOCATE = MapLocate
 return MapLocate
 
 ]=]
-__DAWG_MODULES["dawg/mi24_patch.lua"] = [=[
---[[ MI24V RootPart 补丁（纯净版）
 
-  只做一件事：给 MI24V 补一个 HumanoidRootPart。
-  不碰相机、不碰准星、不碰 Aimbot、不碰 ESP。
+__DAWG_MODULES["dawg/heli_root.lua"] = [=[
+--[[ 载具 HumanoidRootPart 补丁（贴合版）
 
-  目的：让游戏里那些靠 Humanoid.RootPart 定位的功能（比如子弹追踪）
-        能识别到这类没有原生 RootPart 的 AI 载具。
+  问题：MI24V 这类载具有 Humanoid，但 Humanoid.RootPart 是 nil（只读，改不了）
+        XA 的子弹追踪靠 Humanoid.RootPart 定位目标，所以锁不上。
 
-  撤销：getgenv().__DAWG_ROOTPATCH.stop()
+  做法：在载具里建一个名为 "HumanoidRootPart" 的 Part
+        Roblox 的规则：存在这个名的 Part 时，Humanoid 会自动认它
+        每帧把这个 Part 贴到载具的 Chassis / PrimaryPart 上
+
+  撤销：getgenv().__DAWG_HELIROOT.stop()
 ]]
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 
-local VEHICLE_NAMES = { "mi24", "mi8", "heli", "btr", "tank" }
+local VEHICLE_KEYWORDS = { "mi24", "mi8", "heli", "btr", "tank", "uaz" }
 
-local tracked = {}
-local syncConn = nil
+local tracked = {}   -- [vehicleModel] = rootPart
+local conn = nil
 
-local function nameOk(name)
-	local n = string.lower(name)
-	for _, kw in ipairs(VEHICLE_NAMES) do
+local function nameOk(n)
+	n = string.lower(n)
+	for _, kw in ipairs(VEHICLE_KEYWORDS) do
 		if n:find(kw) then return true end
 	end
 	return false
 end
 
-local function isPlainPlayerCharacter(model)
+local function isPlayerChar(model)
 	if Players:GetPlayerFromCharacter(model) then return true end
 	for _, p in ipairs(Players:GetPlayers()) do
-		if p.Character == model or p.Name == model.Name then return true end
+		if p.Character == model then return true end
 	end
 	return false
 end
 
---- 判断是不是我们造的锚点
-local function isOurPart(part)
-	return part:IsA("BasePart")
-		and part.Name == "HumanoidRootPart"
+--- 判断是不是我们造的
+local function isOurRoot(part)
+	return part and part.Name == "HumanoidRootPart"
+		and part:IsA("BasePart")
 		and part.Transparency >= 1
-		and part.Size == Vector3.new(2, 2, 2)
-		and part.CanQuery == false
+		and part.Anchored == true
 end
 
---- 清理该模型下所有旧锚点
-local function cleanOld(model)
-	local n = 0
-	for _, d in ipairs(model:GetChildren()) do
-		if isOurPart(d) then
-			pcall(function() d:Destroy() end)
-			n = n + 1
-		end
-	end
-	return n
-end
+--- 给载具补 RootPart
+local function patch(vehicle)
+	if not vehicle:IsA("Model") then return false end
+	if not nameOk(vehicle.Name) then return false end
+	if isPlayerChar(vehicle) then return false end
 
---- 给模型补 RootPart
-local function patch(model)
-	if not model:IsA("Model") then return false end
-	if not nameOk(model.Name) then return false end
-	if isPlainPlayerCharacter(model) then return false end
-	if not model:FindFirstChildOfClass("Humanoid") then return false end
+	local hum = vehicle:FindFirstChildOfClass("Humanoid")
+	if not hum then return false end
+	-- 已经有非我们造的 RootPart 就不动
+	if hum.RootPart and not isOurRoot(hum.RootPart) then return false end
 
-	-- 原生就有 RootPart 的不动
-	local native = model:FindFirstChild("HumanoidRootPart")
-	if native and native:IsA("BasePart") and not isOurPart(native) then
-		return false
-	end
-
-	local anchor = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+	local anchor = vehicle:FindFirstChild("Chassis") or vehicle.PrimaryPart or vehicle:FindFirstChildWhichIsA("BasePart")
 	if not anchor then return false end
 
-	cleanOld(model)
-
-	local part = Instance.new("Part")
-	part.Name = "HumanoidRootPart"
-	part.Size = Vector3.new(2, 2, 2)
-	part.Transparency = 1
-	part.CanCollide = false
-	part.CanQuery = false
-	part.CanTouch = false
-	part.Massless = true
-	part.Anchored = true
-	part.CFrame = anchor.CFrame
-	pcall(function() part.Parent = model end)
-
-	-- 让 Humanoid 认它
-	pcall(function()
-		local hum = model:FindFirstChildOfClass("Humanoid")
-		if hum and hum.RootPart ~= part then
-			hum.RootPart = part
+	-- 清掉所有旧锚点
+	for _, d in ipairs(vehicle:GetChildren()) do
+		if d.Name == "HumanoidRootPart" and isOurRoot(d) then
+			pcall(function() d:Destroy() end)
 		end
-	end)
+	end
 
-	tracked[model] = part
+	local rp = Instance.new("Part")
+	rp.Name = "HumanoidRootPart"
+	rp.Size = Vector3.new(4, 4, 4)
+	rp.Transparency = 1
+	rp.CanCollide = false
+	rp.CanQuery = true
+	rp.CanTouch = false
+	rp.Massless = true
+	rp.Anchored = true
+	rp.CFrame = anchor.CFrame
+	rp.Parent = vehicle
+
+	tracked[vehicle] = rp
 	return true
 end
 
@@ -26210,455 +26281,414 @@ end
 local function scan()
 	local n = 0
 	local seen = {}
-	local function visit(container)
-		if not container or seen[container] then return end
+	local function visit(container, depth)
+		if not container or depth > 5 or seen[container] then return end
 		seen[container] = true
 		for _, c in ipairs(container:GetChildren()) do
 			if c:IsA("Model") and nameOk(c.Name) then
 				if patch(c) then n = n + 1 end
 			end
 			if c:IsA("Folder") or c:IsA("Model") then
-				for _, sub in ipairs(c:GetChildren()) do
-					if sub:IsA("Model") and nameOk(sub.Name) then
-						if patch(sub) then n = n + 1 end
-					end
-				end
+				visit(c, depth + 1)
 			end
 		end
 	end
-	visit(workspace:FindFirstChild("AiZones"))
-	visit(workspace:FindFirstChild("Vehicles"))
+	-- 只扫可能放载具的区域，不遍历整个 workspace（那里有十几万实例）
+	visit(workspace:FindFirstChild("AiZones"), 0)
+	visit(workspace:FindFirstChild("Vehicles"), 0)
 	return n
 end
 
---- 每帧同步位置（载具会飞）
-local function startSync()
-	if syncConn then return end
-	syncConn = RunService.RenderStepped:Connect(function()
-		for model, part in pairs(tracked) do
-			if not model.Parent or not part.Parent then
-				tracked[model] = nil
-			else
-				local anchor = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
-				if anchor then part.CFrame = anchor.CFrame end
+--- 快速探测：当前有没有载具（很轻，只看 AiZones 两层）
+local function hasVehicle()
+	local az = workspace:FindFirstChild("AiZones")
+	if not az then return false end
+	for _, f in ipairs(az:GetChildren()) do
+		if f:IsA("Model") and nameOk(f.Name) then return true end
+		if f:IsA("Folder") then
+			for _, m in ipairs(f:GetChildren()) do
+				if m:IsA("Model") and nameOk(m.Name) then return true end
 			end
 		end
-	end)
+	end
+	return false
 end
 
-local first = scan()
-startSync()
+-- 每帧只同步「已跟踪」的，没有就不做事
+conn = RunService.RenderStepped:Connect(function()
+	if next(tracked) == nil then return end   -- 没有跟踪目标 → 直接返回，不空转
+	for vehicle, rp in pairs(tracked) do
+		if not vehicle.Parent or not rp.Parent then
+			tracked[vehicle] = nil
+		else
+			local anchor = vehicle:FindFirstChild("Chassis") or vehicle.PrimaryPart
+			if anchor then rp.CFrame = anchor.CFrame end
+		end
+	end
+end)
 
--- 持续检测新载具
+-- 每 3 秒扫一次 AiZones（只扫这一层，很小；patch 内部会跳过已补的）
 task.spawn(function()
 	while true do
-		task.wait(2)
+		task.wait(3)
 		pcall(scan)
+		-- 清掉失效引用
+		for v, rp in pairs(tracked) do
+			if not v.Parent or not rp.Parent then tracked[v] = nil end
+		end
 	end
 end)
 
 local names = {}
-for m in pairs(tracked) do names[#names + 1] = m.Name end
-print(string.format("[RootPatch] 就位 · 处理 %d 个载具: %s", first, table.concat(names, ", ")))
+for v in pairs(tracked) do names[#names + 1] = v.Name end
+print(string.format("[载具Root] 已补 %d 个: %s", #names, table.concat(names, ", ")))
 
 local M = {
 	scan = scan,
 	count = function() local c = 0 for _ in pairs(tracked) do c = c + 1 end return c end,
 	list = function()
 		local l = {}
-		for m, p in pairs(tracked) do
-			l[#l + 1] = string.format("%s root@%.0f,%.0f,%.0f primary@%.0f,%.0f,%.0f",
-				m.Name,
-				p.Position.X, p.Position.Y, p.Position.Z,
-				m.PrimaryPart and m.PrimaryPart.Position.X or 0,
-				m.PrimaryPart and m.PrimaryPart.Position.Y or 0,
-				m.PrimaryPart and m.PrimaryPart.Position.Z or 0)
+		for v, rp in pairs(tracked) do
+			local hum = v:FindFirstChildOfClass("Humanoid")
+			l[#l + 1] = string.format("%s root=%.0f,%.0f,%.0f humRootPart=%s hp=%.0f",
+				v.Name,
+				rp.Position.X, rp.Position.Y, rp.Position.Z,
+				hum and (hum.RootPart and hum.RootPart.Name or "nil") or "nohum",
+				hum and hum.Health or -1)
 		end
 		return l
 	end,
 	stop = function()
-		if syncConn then syncConn:Disconnect() syncConn = nil end
-		for model, part in pairs(tracked) do
-			pcall(function() part:Destroy() end)
-			tracked[model] = nil
+		if conn then conn:Disconnect() conn = nil end
+		for v, rp in pairs(tracked) do
+			pcall(function() rp:Destroy() end)
+			tracked[v] = nil
 		end
-		print("[RootPatch] 已撤销")
+		print("[载具Root] 已撤销")
 	end,
 }
-getgenv().__DAWG_ROOTPATCH = M
+getgenv().__DAWG_HELIROOT = M
 return M
 
 ]=]
-__DAWG_MODULES["dawg/crew_patch.lua"] = [=[
---[[ 载具内 NPC 补丁（Pilot / Gunner）
+__DAWG_MODULES["dawg/crew_shadow.lua"] = [=[
+--[[ 飞机机组影子（让 XA 的子弹追踪能连上）
 
-  问题：MI24V 机头虽然放了 Pilot / Gunner 两个人形模型，
-        但它们只有 Head/UpperTorso/Helmet，没有 Humanoid 也没有 RootPart。
-        所以所有靠 Humanoid 判定的功能（ESP / 子弹追踪 / 锁定）都不认。
+  问题：MI24V 的 Pilot/Gunner 在 AiZones.HeliAirfield.MI24V.Pilots 下（第 3 层），
+        XA 的子弹追踪只扫第 1 层（AiZones.<zone>.<NPC>），够不到。
 
-  做法：给这类「贴在载具上的人形 Model」补：
-        - Humanoid
-        - HumanoidRootPart（锚在 Head 位置）
+  做法：在 workspace.AiZones 下直接创建一个「影子 NPC」（第 1 层），
+        名字模仿普通 AI 士兵，带 Humanoid + HumanoidRootPart + Head，
+        每帧把位置同步到真实 Pilot/Gunner 的 Head 上。
 
-  不碰载具本体、不碰玩家、不碰其他功能。
+  这样 XA 的子弹追踪就把影子当成普通 NPC，能连线、能锁定。
 
-  撤销：getgenv().__DAWG_CREWPATCH.stop()
+  撤销：getgenv().__DAWG_CREWSHADOW.stop()
 ]]
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 
-local CREW_NAMES = { "pilot", "gunner", "crew", "driver" }
-local CREW_PARENTS = { "Pilots" }
+-- 影子宿主：优先塞进一个已经有 AI 士兵的 Zone Folder（和真 NPC 同层，XA 才会遍历到）
+-- 找不到就退回 AiZones 本身
+local HOST_FOLDER_PREFER = { "AirfieldATC", "ExitUNO1", "Bridge", "AirfieldSniper" }
 
-local tracked = {}   -- [model] = {hum, rootPart}
-local syncConn = nil
-
-local function nameOk(name)
-	local n = string.lower(name)
-	for _, kw in ipairs(CREW_NAMES) do
-		if n == kw or n:find(kw) then return true end
-	end
-	return false
-end
-
-local function isOurRoot(part)
-	return part:IsA("BasePart")
-		and part.Name == "HumanoidRootPart"
-		and part.Transparency >= 1
-		and part.Size == Vector3.new(2, 2, 2)
-		and part.CanQuery == false
-end
-
---- 清理旧件
-local function cleanOld(model)
-	for _, d in ipairs(model:GetChildren()) do
-		if isOurRoot(d) then pcall(function() d:Destroy() end) end
-	end
-	local oldHum = model:FindFirstChild("__DawgCrewHumanoid")
-	if oldHum then pcall(function() oldHum:Destroy() end) end
-	for _, d in ipairs(model:GetChildren()) do
-		if d:IsA("Humanoid") and d.Name == "__DawgCrewHumanoid" then
-			pcall(function() d:Destroy() end)
+--- 挑一个合适的宿主 Folder
+local function pickHost()
+	local az = workspace:FindFirstChild("AiZones")
+	if not az then return workspace end
+	-- 1) 优先名单里、存在且有 Model 的
+	for _, name in ipairs(HOST_FOLDER_PREFER) do
+		local f = az:FindFirstChild(name)
+		if f and f.ClassName == "Folder" then
+			local hasModel = false
+			for _, c in ipairs(f:GetChildren()) do
+				if c.ClassName == "Model" then hasModel = true break end
+			end
+			if hasModel then return f end
 		end
 	end
-end
-
---- 给一个 crew model 补 Humanoid + RootPart
-local function patchCrew(model)
-	if not model:IsA("Model") then return false end
-	if not nameOk(model.Name) then return false end
-	-- 只处理在载具 Pilots 容器里的
-	local parent = model.Parent
-	if not parent or string.lower(parent.Name) ~= "pilots" then return false end
-	-- 排除玩家
-	if Players:GetPlayerFromCharacter(model) then return false end
-
-	local head = model:FindFirstChild("Head")
-	local torso = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
-	local anchor = head or torso or model:FindFirstChildWhichIsA("BasePart")
-	if not anchor then return false end
-
-	cleanOld(model)
-
-	local rec = tracked[model]
-	if not rec then
-		rec = {}
-		tracked[model] = rec
-	end
-
-	-- 1) Humanoid
-	local hum = model:FindFirstChildOfClass("Humanoid")
-	if not hum then
-		hum = Instance.new("Humanoid")
-		hum.Name = "__DawgCrewHumanoid"
-		hum.MaxHealth = 100
-		hum.Health = 100
-		hum.WalkSpeed = 0
-		hum.JumpPower = 0
-		hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
-		pcall(function() hum.Parent = model end)
-	end
-	rec.hum = hum
-
-	-- 2) RootPart
-	local rootPart = model:FindFirstChild("HumanoidRootPart")
-	if not (rootPart and rootPart:IsA("BasePart") and not isOurRoot(rootPart)) then
-		rootPart = Instance.new("Part")
-		rootPart.Name = "HumanoidRootPart"
-		rootPart.Size = Vector3.new(2, 2, 2)
-		rootPart.Transparency = 1
-		rootPart.CanCollide = false
-		rootPart.CanQuery = false
-		rootPart.CanTouch = false
-		rootPart.Massless = true
-		rootPart.Anchored = true
-		rootPart.CFrame = anchor.CFrame
-		pcall(function() rootPart.Parent = model end)
-	end
-	rec.root = rootPart
-
-	-- 3) Humanoid 认 RootPart
-	pcall(function()
-		if hum and hum.RootPart ~= rootPart then hum.RootPart = rootPart end
-	end)
-
-	return true
-end
-
---- 扫描
-local function scan()
-	local n = 0
-	local function visitCrew(container)
-		if not container then return end
-		for _, c in ipairs(container:GetChildren()) do
-			if c:IsA("Model") and string.lower(c.Name) == "pilots" then
-				for _, sub in ipairs(c:GetChildren()) do
-					if sub:IsA("Model") and nameOk(sub.Name) then
-						if patchCrew(sub) then n = n + 1 end
-					end
+	-- 2) 任意一个有 Model 的 Folder
+	for _, f in ipairs(az:GetChildren()) do
+		if f.ClassName == "Folder" then
+			for _, c in ipairs(f:GetChildren()) do
+				if c.ClassName == "Model" and c:FindFirstChildOfClass("Humanoid") then
+					return f
 				end
 			end
 		end
 	end
-	-- 找所有载具容器
-	local function walk(root, depth)
-		if depth > 4 then return end
-		for _, c in ipairs(root:GetChildren()) do
-			if c:IsA("Model") and string.lower(c.Name):find("mi24") then
-				local pilots = c:FindFirstChild("Pilots")
-				if pilots then visitCrew(c) end
-			end
-			if c:IsA("Folder") or c:IsA("Model") then
-				walk(c, depth + 1)
+	return az
+end
+-- 影子名字：模仿普通 AI 士兵的攻击目标
+local SHADOW_NAMES = { "OccupantSoldier", "UNOSoldier" }
+
+local shadows = {}    -- [realModel] = {model, hum, root, head}
+local CFG_ALIVE = true
+
+-- RootPart 放大包住整架飞机（否则永远被机体碰撞体挡住，射线命中不到）
+-- Head 仍贴在机头位置，给需要 Head 的逻辑用
+local ROOT_MARGIN = 3
+
+--- 算载具包围盒
+local function vehicleBox(vehicle)
+	local ok, cf, size = pcall(function()
+		local a, b = vehicle:GetBoundingBox()
+		return a, b
+	end)
+	if not ok or not cf then return nil end
+	return cf, size
+end
+
+local syncConn = nil
+
+--- 找所有飞机机组（Pilot / Gunner）
+local function findCrew()
+	local result = {}
+	local function visit(container, depth)
+		if not container or depth > 5 then return end
+		for _, c in ipairs(container:GetChildren()) do
+			if c.ClassName == "Model" then
+				local n = string.lower(c.Name)
+				if n:find("mi24") or n:find("heli") then
+					local pilots = c:FindFirstChild("Pilots")
+					if pilots then
+						-- 每架飞机只取一个机组：Pilot 优先，没有就用第一个有 Head 的
+						local chosen = nil
+						for _, sub in ipairs(pilots:GetChildren()) do
+							if sub.ClassName == "Model" and sub.Name:lower() == "pilot" then
+								chosen = sub
+								break
+							end
+						end
+						if not chosen then
+							for _, sub in ipairs(pilots:GetChildren()) do
+								if sub.ClassName == "Model" and sub:FindFirstChild("Head") then
+									chosen = sub
+									break
+								end
+							end
+						end
+						if chosen and chosen:FindFirstChild("Head") then
+							result[#result + 1] = chosen
+						end
+					end
+				end
+				visit(c, depth + 1)
+			elseif c.ClassName == "Folder" then
+				visit(c, depth + 1)
 			end
 		end
 	end
-	walk(workspace:FindFirstChild("AiZones") or workspace, 0)
-	walk(workspace, 0)
-	return n
+	visit(workspace:FindFirstChild("AiZones"), 0)
+	visit(workspace:FindFirstChild("Vehicles"), 0)
+	return result
 end
 
---- 每帧同步位置（跟着飞机飞）
-local function startSync()
-	if syncConn then return end
-	syncConn = RunService.RenderStepped:Connect(function()
-		for model, rec in pairs(tracked) do
-			if not model.Parent or not rec.root or not rec.root.Parent then
-				tracked[model] = nil
-			else
-				local head = model:FindFirstChild("Head")
-				local anchor = head or model:FindFirstChild("UpperTorso") or model:FindFirstChildWhichIsA("BasePart")
-				if anchor then rec.root.CFrame = anchor.CFrame end
+--- 给一个真实机组创建一个影子
+local function makeShadow(realModel, index)
+	local host = pickHost()
+	local name = SHADOW_NAMES[(index - 1) % #SHADOW_NAMES + 1]
+
+	local shadow = Instance.new("Model")
+	shadow.Name = name
+
+	-- RootPart
+	local root = Instance.new("Part")
+	root.Name = "HumanoidRootPart"
+	root.Size = Vector3.new(2, 2, 1)
+	root.Transparency = 1
+	root.CanCollide = false
+	root.CanQuery = true      -- 让射线能检测到（子弹追踪需要）
+	root.CanTouch = false
+	root.Massless = true
+	root.Anchored = true
+	root.Parent = shadow
+
+	-- Head
+	local head = Instance.new("Part")
+	head.Name = "Head"
+	head.Size = Vector3.new(2, 1, 1)
+	head.Transparency = 1
+	head.CanCollide = false
+	head.CanQuery = true      -- 让射线能检测到
+	head.CanTouch = false
+	head.Massless = true
+	head.Anchored = true
+	head.Parent = shadow
+
+	-- Humanoid
+	local hum = Instance.new("Humanoid")
+	hum.MaxHealth = 100
+	hum.Health = 100
+	hum.WalkSpeed = 0
+	hum.JumpPower = 0
+	-- 不显示名字和血量（ESP 里只保留线，不显示文字）
+	hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+	hum.NameDisplayDistance = 0
+	hum.HealthDisplayDistance = 0
+	hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+	hum.DisplayName = ""
+	hum.Parent = shadow
+
+	-- 位置先贴到真实 Head
+	local realHead = realModel:FindFirstChild("Head")
+	local vehicle = realModel.Parent and realModel.Parent.Parent
+	local boxCf, boxSize
+	if vehicle then boxCf, boxSize = vehicleBox(vehicle) end
+	if boxCf and boxSize then
+		root.Size = boxSize + Vector3.new(ROOT_MARGIN * 2, ROOT_MARGIN * 2, ROOT_MARGIN * 2)
+		-- 位置用底盘（和载具 HumanoidRootPart 重合，避免出现两个位置不同的锁定点）
+		local anchor = vehicle:FindFirstChild("Chassis") or vehicle.PrimaryPart
+		root.CFrame = anchor and anchor.CFrame or boxCf
+	elseif realHead then
+		root.Size = Vector3.new(2, 2, 2)
+		root.CFrame = realHead.CFrame
+	end
+	head.Size = Vector3.new(2, 2, 2)
+	if realHead then head.CFrame = realHead.CFrame end
+
+	shadow.Parent = host
+	shadow:SetAttribute("__DawgShadow", true)
+
+	return { model = shadow, hum = hum, root = root, head = head, real = realModel }
+end
+
+--- 快速探测：有没有载具
+local function hasVehicle()
+	local function visit(c, depth)
+		if not c or depth > 3 then return false end
+		for _, ch in ipairs(c:GetChildren()) do
+			if ch:IsA("Model") then
+				local n = string.lower(ch.Name)
+				if n:find("mi24") or n:find("heli") then return true end
+			end
+			if ch:IsA("Folder") or ch:IsA("Model") then
+				if visit(ch, depth + 1) then return true end
 			end
 		end
-	end)
+		return false
+	end
+	return visit(workspace:FindFirstChild("AiZones"), 0)
 end
 
-local first = scan()
-startSync()
-task.spawn(function()
-	while true do
-		task.wait(3)
-		pcall(scan)
+--- 只同步已存在影子的位置（每帧跑，很轻）
+local function syncPositions()
+	for realModel, rec in pairs(shadows) do
+		if not realModel.Parent or not rec.model.Parent then
+			pcall(function() rec.model:Destroy() end)
+			shadows[realModel] = nil
+		else
+			local realHead = realModel:FindFirstChild("Head")
+			local vehicle = realModel.Parent and realModel.Parent.Parent
+			local boxCf, boxSize
+			if vehicle then boxCf, boxSize = vehicleBox(vehicle) end
+			if boxCf and boxSize then
+				rec.root.Size = boxSize + Vector3.new(ROOT_MARGIN * 2, ROOT_MARGIN * 2, ROOT_MARGIN * 2)
+				local anchor = vehicle:FindFirstChild("Chassis") or vehicle.PrimaryPart
+				rec.root.CFrame = anchor and anchor.CFrame or boxCf
+			elseif realHead then
+				rec.root.CFrame = realHead.CFrame
+			end
+			if realHead then rec.head.CFrame = realHead.CFrame end
+		end
+	end
+end
+
+--- 扫描 + 创建/清理（定时跑）
+local function sync()
+	local crew = findCrew()
+	local alive = {}
+	for i, realModel in ipairs(crew) do
+		alive[realModel] = true
+		if not shadows[realModel] or not shadows[realModel].model.Parent then
+			shadows[realModel] = makeShadow(realModel, i)
+		end
+		local rec = shadows[realModel]
+		if rec and rec.model.Parent then
+			local realHead = realModel:FindFirstChild("Head")
+			local vehicle = realModel.Parent and realModel.Parent.Parent
+			local boxCf, boxSize
+			if vehicle then boxCf, boxSize = vehicleBox(vehicle) end
+			if boxCf and boxSize then
+				rec.root.Size = boxSize + Vector3.new(ROOT_MARGIN * 2, ROOT_MARGIN * 2, ROOT_MARGIN * 2)
+				local anchor = vehicle:FindFirstChild("Chassis") or vehicle.PrimaryPart
+				rec.root.CFrame = anchor and anchor.CFrame or boxCf
+			elseif realHead then
+				rec.root.CFrame = realHead.CFrame
+			end
+			if realHead then rec.head.CFrame = realHead.CFrame end
+		end
+	end
+	-- 清理消失的
+	for realModel, rec in pairs(shadows) do
+		if not alive[realModel] then
+			pcall(function() rec.model:Destroy() end)
+			shadows[realModel] = nil
+		end
+	end
+end
+
+-- 先把之前留下的影子全清掉（AiZones 下两层都扫）
+do
+	local az = workspace:FindFirstChild("AiZones")
+	if az then
+		for _, c in ipairs(az:GetChildren()) do
+			if c:GetAttribute("__DawgShadow") then pcall(function() c:Destroy() end) end
+			if c.ClassName == "Folder" then
+				for _, d in ipairs(c:GetChildren()) do
+					if d:GetAttribute("__DawgShadow") then pcall(function() d:Destroy() end) end
+				end
+			end
+		end
+	end
+end
+
+sync()
+-- 每帧：只同步已有影子的位置（没有就什么都不做）
+syncConn = RunService.RenderStepped:Connect(function()
+	if next(shadows) ~= nil then
+		pcall(syncPositions)
 	end
 end)
 
-local names = {}
-for m, rec in pairs(tracked) do
-	names[#names + 1] = m.Name .. "(hum=" .. tostring(rec.hum ~= nil) .. ")"
-end
-print(string.format("[CrewPatch] 就位 · 处理 %d 个: %s", first, table.concat(names, ", ")))
+-- 每 2 秒：扫描有没有新飞机，有就创建影子（这是唯一的「创建」入口）
+task.spawn(function()
+	while CFG_ALIVE do
+		task.wait(2)
+		pcall(sync)
+	end
+end)
+
+local n = 0
+for _ in pairs(shadows) do n = n + 1 end
+print(string.format("[机组影子] 已创建 %d 个影子 NPC（宿主：%s）", n, pickHost().Name))
 
 local M = {
-	scan = scan,
-	count = function() local c = 0 for _ in pairs(tracked) do c = c + 1 end return c end,
+	count = function() local c = 0 for _ in pairs(shadows) do c = c + 1 end return c end,
 	list = function()
 		local l = {}
-		for m, rec in pairs(tracked) do
-			local head = m:FindFirstChild("Head")
-			l[#l + 1] = string.format("%s.%s hum=%s root=%s headPos=%s",
-				m.Parent and m.Parent.Parent and m.Parent.Parent.Name or "?",
-				m.Name,
-				tostring(rec.hum ~= nil),
-				tostring(rec.root ~= nil),
+		for realModel, rec in pairs(shadows) do
+			local head = rec.real and rec.real:FindFirstChild("Head")
+			l[#l + 1] = string.format("%s ← %s @ %s", rec.model.Name, realModel.Name,
 				head and string.format("%.0f,%.0f,%.0f", head.Position.X, head.Position.Y, head.Position.Z) or "nil")
 		end
 		return l
 	end,
 	stop = function()
+		CFG_ALIVE = false
 		if syncConn then syncConn:Disconnect() syncConn = nil end
-		for model, rec in pairs(tracked) do
-			if rec.root then pcall(function() rec.root:Destroy() end) end
-			if rec.hum then pcall(function() rec.hum:Destroy() end) end
-			tracked[model] = nil
+		for realModel, rec in pairs(shadows) do
+			pcall(function() rec.model:Destroy() end)
+			shadows[realModel] = nil
 		end
-		print("[CrewPatch] 已撤销")
+		print("[机组影子] 已撤销")
 	end,
 }
-getgenv().__DAWG_CREWPATCH = M
+getgenv().__DAWG_CREWSHADOW = M
 return M
 
 ]=]
-__DAWG_MODULES["dawg/kill_burst_monitor.lua"] = [[
--- 秒杀爆发监控（常驻后台，抓到就写文件）
--- 用法：loadstring(readfile("dawg/kill_burst_monitor.lua"))()
--- 日志：kill_burst_log.txt
-
-local Players = game:GetService("Players")
-local t0 = os.clock()
-local watched = {}
-local recent = {}        -- 最近 5 秒内的死亡
-local reported = {}      -- 已上报的爆发时间点
-
-local LOG = "kill_burst_log.txt"
-
-local function writeLog(line)
-	local ok, old = pcall(function() return readfile(LOG) end)
-	local content = (ok and old or "") .. os.date("%H:%M:%S ") .. line .. "\n"
-	pcall(writefile, LOG, content)
-end
-
-local function posOf(p)
-	local c = p.Character
-	local h = c and c:FindFirstChild("HumanoidRootPart")
-	if h then return string.format("%.0f,%.0f,%.0f", h.Position.X, h.Position.Y, h.Position.Z) end
-	return "nil"
-end
-
-local deathMark = {}   -- [名字] = 上次记录时间（去重）
-
-local function onDeath(victim)
-	local now = os.clock()
-	-- 去重：同一个人 5 秒内只记一次（Died + 血量检测可能重复触发）
-	local last = deathMark[victim.Name]
-	if last and (now - last) < 5 then return end
-	deathMark[victim.Name] = now
-
-	local entry = {
-		t = now,
-		name = victim.Name,
-		pos = posOf(victim),
-	}
-	table.insert(recent, entry)
-
-	-- 清理 10 秒前的
-	for i = #recent, 1, -1 do
-		if now - recent[i].t > 10 then table.remove(recent, i) end
-	end
-
-	-- 统计最近 3 秒内死亡人数
-	local cnt = 0
-	for _, r in ipairs(recent) do
-		if now - r.t <= 3 then cnt = cnt + 1 end
-	end
-
-	-- 3 秒内死 3 人以上 → 判定为爆发
-	if cnt >= 3 then
-		local bucket = math.floor(now / 3)
-		if reported[bucket] then return end
-		reported[bucket] = true
-
-		local names = {}
-		local positions = {}
-		for _, r in ipairs(recent) do
-			if now - r.t <= 3 then
-				names[#names + 1] = r.name
-				positions[#positions + 1] = r.pos
-			end
-		end
-		local line = string.format("【爆发】3秒内%d人死亡: %s | 位置: %s",
-			cnt, table.concat(names, ","):sub(1, 120), table.concat(positions, " / "):sub(1, 150))
-		writeLog(line)
-		print(line)
-
-		-- 同时记录当时所有活着的玩家（嫌疑人）
-		local alive = {}
-		for _, p in ipairs(Players:GetPlayers()) do
-			local h = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
-			if h and h.Health > 0 and p ~= Players.LocalPlayer then
-				alive[#alive + 1] = p.Name
-			end
-		end
-		writeLog("  当时活着: " .. table.concat(alive, ","):sub(1, 200))
-	end
-end
-
-local function watch(p)
-	local c = p.Character
-	if not c then return end
-	local h = c:FindFirstChildOfClass("Humanoid")
-	if not h or watched[h] then return end
-	watched[h] = true
-	h.Died:Connect(function() onDeath(p) end)
-end
-
-for _, p in ipairs(Players:GetPlayers()) do
-	if p ~= Players.LocalPlayer then
-		watch(p)
-		p.CharacterAdded:Connect(function()
-			task.wait(0.6)
-			watch(p)
-		end)
-	end
-end
-
-Players.PlayerAdded:Connect(function(p)
-	p.CharacterAdded:Connect(function()
-		task.wait(0.6)
-		watch(p)
-	end)
-end)
-
--- 轮询补挂：远处玩家角色可能延迟加载，Humanoid 出现时间不确定
-task.spawn(function()
-	while true do
-		task.wait(1.5)
-		for _, p in ipairs(Players:GetPlayers()) do
-			if p ~= Players.LocalPlayer then
-				pcall(watch, p)
-			end
-		end
-	end
-end)
-
--- 同时监控血量骤降（有些死亡不走 Died 事件）
-local lastHealth = {}
-task.spawn(function()
-	while true do
-		task.wait(0.5)
-		for _, p in ipairs(Players:GetPlayers()) do
-			if p ~= Players.LocalPlayer then
-				local c = p.Character
-				local h = c and c:FindFirstChildOfClass("Humanoid")
-				if h then
-					local prev = lastHealth[p.Name]
-					local cur = h.Health
-					if prev and prev > 0 and cur <= 0 then
-						onDeath(p)
-					end
-					lastHealth[p.Name] = cur
-				end
-			end
-		end
-	end
-end)
-
-local M = {
-	active = true,
-	recent = recent,
-	stop = function() M.active = false end,
-	status = function()
-		return string.format("监控中 · 已记录 %d 次死亡", #recent)
-	end,
-}
-getgenv().__DAWG_KILLMON = M
-
-writeLog("=== 秒杀监控启动 ===")
-print("[秒杀监控] 已启动 · 3秒内死3人以上会记录到 kill_burst_log.txt")
-return M
-
-]]
 
 local __DAWG_RAW = "https://raw.githubusercontent.com/Ikun02-qq/dawan/main/"
 local function __dawgLoadModule(path, chunkname)
@@ -26957,21 +26987,20 @@ pcall(function()
 							return masterSw.Position.X.Offset > 0 or masterSw.Position.X.Scale > 0.5
 						end
 
-						-- 总开关点击 → 同步前置条件
-						masterBtn.MouseButton1Click:Connect(function()
-							task.wait(0.35)
-							local m = __lzLoad()
-							if m and m.setMaster then
-								m.setMaster(masterIsOn())
-							end
-						end)
-
-						-- 初始化一次
+						-- 总开关 → 定时轮询同步（最可靠）
+						-- 不用点击监听：总开关有 4 个连接，点击回调可能在滑块变色前就跑，读到旧值
 						task.spawn(function()
-							task.wait(2)
-							local m = __lzLoad()
-							if m and m.setMaster then
-								m.setMaster(masterIsOn())
+							local last = nil
+							while true do
+								task.wait(0.5)
+								local m = __lzLoad()
+								if m and m.setMaster and masterSw then
+									local now = masterIsOn()
+									if now ~= last then
+										last = now
+										m.setMaster(now)
+									end
+								end
 							end
 						end)
 
@@ -27054,6 +27083,64 @@ pcall(function()
 						if m then m.toggleInv() end
 					end)
 				end
+
+				-- 无后坐力（改 HumanoidRootPart 的 Recoil / Flinch Attribute）
+				if not __lzHas(objsUtil, "无后坐力") then
+					local __nrOn = false
+					local __nrConn = nil
+					local function __nrApply()
+						local lp = game:GetService("Players").LocalPlayer
+						local ch = lp.Character
+						local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+						if not hrp then return end
+						pcall(function()
+							if hrp:GetAttribute("Recoil") ~= 0 then
+								hrp:SetAttribute("Recoil", 0)
+							end
+							if hrp:GetAttribute("Flinch") ~= 0 then
+								hrp:SetAttribute("Flinch", 0)
+							end
+						end)
+					end
+					local function __nrStart()
+						if __nrConn then return end
+						__nrConn = game:GetService("RunService").Heartbeat:Connect(function()
+							if __nrOn then __nrApply() end
+						end)
+						-- 角色重生后补一次
+						local lp = game:GetService("Players").LocalPlayer
+						lp.CharacterAdded:Connect(function(ch)
+							task.wait(0.6)
+							if __nrOn then __nrApply() end
+						end)
+						__nrApply()
+					end
+					local function __nrStop()
+						if __nrConn then
+							__nrConn:Disconnect()
+							__nrConn = nil
+						end
+						local lp = game:GetService("Players").LocalPlayer
+						local ch = lp.Character
+						local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+						if hrp then
+							pcall(function()
+								hrp:SetAttribute("Recoil", 1)
+								hrp:SetAttribute("Flinch", 1)
+							end)
+						end
+					end
+
+					__lzMakeToggle(objsUtil, "无后坐力", function(on)
+						__nrOn = on and true or false
+						if __nrOn then
+							__nrStart()
+						else
+							__nrStop()
+						end
+					end)
+					print("[XA] 无后坐力开关已就位")
+				end
 				-- 新开关插入后，按 XA 自己的公式重算 Section 高度和 Tab CanvasSize
 				local function __fixHeight()
 					-- 1) 每个 Section：36 + Objs 内容高度 + 8
@@ -27096,6 +27183,29 @@ pcall(function()
 		task.wait(0.15)
 	end
 	warn("[XA] 战利品开关插入失败")
+end)
+
+
+-- ============ 载具锁定支持（自动，不显示开关）============
+-- 让 XA 的子弹追踪能连接并锁定直升机 / 装甲车
+task.spawn(function()
+	task.wait(3)   -- 等 XA UI 建好再启动
+	local ok1, m1 = pcall(function()
+		return __dawgLoadModule("dawg/heli_root.lua", "@XA_HELIROOT")
+	end)
+	if not ok1 then
+		warn("[XA] 载具Root补丁加载失败: " .. tostring(m1):sub(1, 120))
+	end
+	task.wait(0.5)
+	local ok2, m2 = pcall(function()
+		return __dawgLoadModule("dawg/crew_shadow.lua", "@XA_CREWSHADOW")
+	end)
+	if not ok2 then
+		warn("[XA] 机组影子加载失败: " .. tostring(m2):sub(1, 120))
+	end
+	if ok1 or ok2 then
+		print("[XA] 载具锁定支持已启动（子弹追踪可锁定直升机）")
+	end
 end)
 
 if not __xaOk then error(__xaRes) end
