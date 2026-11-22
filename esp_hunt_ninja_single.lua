@@ -40,21 +40,1800 @@ if not CAPS.Drawing then
 	})
 end
 
--- 自动 boot DawgKit：忍者里通常不会预先加载，这里补齐
+-- ============ 内嵌 DawgKit（单文件版，零外部依赖） ============
+-- DawgKit 末尾有 return，直接拼会让整个 chunk 提前结束、ESP 主体一行都不执行，
+-- 所以必须包进一个函数里再由这里调用。
 local Kit = GENV.__DAWG_KIT
 if not Kit then
-	local okBoot = pcall(function()
-		if CAPS.readfile then
-			local src = readfile("DawgKit.lua")
-			if src and #src > 1000 then
-				local fn = loadstring(src)
-				if fn then fn() end
+	local __bootKit = function()
+		--[[=========================================================================
+		  DawgKit v1.0.1 · Roblox 脚本开发底座（单文件，零依赖）
+		  用法：loadstring(readfile("DawgKit.lua"))()  →  拿到 Kit
+		        Studio 里当 ModuleScript：local Kit = require(script.DawgKit)
+		
+		  设计原则（全部来自 总结/00_坑清单 的 85 条）：
+		    · 默认什么都不做（K66）—— 加载只做只读准备，功能全等用户点
+		    · hook 常驻、开关只控制放行，不提供「恢复」（K26）
+		    · hook 里只调 hookfunction 的返回值（K24），全局只装一次（K25）
+		    · 只信 pcall 结果，不做对象比较（K35）
+		    · 面板挂 CoreGui/gethui，DisplayOrder 1e6，不补偿 58px（K45/K46）
+		    · 每帧/每个属性都现取 Character，绝不缓存（K59）
+		    · 所有速度/位移用「小步 CFrame」或抗重力 BV，不改 WalkSpeed（K10/K12/K17）
+		=========================================================================]]
+		
+		local Players    = game:GetService("Players")
+		local RunService = game:GetService("RunService")
+		local UIS        = game:GetService("UserInputService")
+		local HttpService= game:GetService("HttpService")
+		local Workspace  = game:GetService("Workspace")
+		
+		local Kit = {}
+		Kit.version = "1.2.6"
+		Kit.lastError = nil
+		
+		------------------------------------------------------------------ 0. 环境
+		-- K37：checkcaller / getgenv / gethui 都可能不存在，全部 pcall 探测
+		local function safe(f, ...)
+			local ok, a, b = pcall(f, ...)
+			if ok then return a, b end
+			return nil
+		end
+		
+		local GENV = safe(function() return getgenv() end) or _G
+		local RENV = safe(function() return getrenv() end) or _G
+		local HUI  = safe(function() return gethui() end) or safe(function() return game:GetService("CoreGui") end)
+		
+		-- K86：实测这是 Potassium 的 getgenv() ~= _G，执行器函数（readfile/writefile/
+		-- hookfunction/getconnections…）只挂在 genv 上，rawget(_G) 拿到的是 nil。
+		-- 所有执行器能力统一走这个取值器：先 genv，再 _G 兜底。
+		local function g(name)
+			local v = GENV[name]
+			if v == nil then v = rawget(_G, name) end
+			return v
+		end
+		Kit.env = {
+			isExecutor = type(GENV.getgenv) == "function" or type(g("hookfunction")) == "function",
+			genv = GENV, renv = RENV, hui = HUI,
+			isStudio   = RunService:IsStudio(),
+			hasHook    = type(g("hookfunction")) == "function",
+			hasConn    = type(g("getconnections")) == "function",
+			hasFile    = type(g("writefile")) == "function",
+		}
+		
+		------------------------------------------------------------------ 1. 日志
+		local TAG = "[DawgKit]"
+		local LINES = {}
+		local function fmt(...)
+			local t = {}
+			for i = 1, select("#", ...) do t[i] = tostring((select(i, ...))) end
+			return table.concat(t, " ")
+		end
+		
+		function Kit.log(...)
+			local line = fmt(...)
+			LINES[#LINES + 1] = line
+			if #LINES > 200 then table.remove(LINES, 1) end
+			print(TAG, line)
+			return line
+		end
+		
+		-- K61：pcall 必须把 err 留下来，不能吞
+		-- 错误归一化：去掉「chunk:行号」和具体数字，同一个坑才会累加到同一条
+		local function normErr(msg)
+			local m = tostring(msg)
+			m = m:gsub("^[%w_%.%(%)%-]+:%d+:%s*", "")
+			m = m:gsub("%d+", "#")
+			return m
+		end
+		
+		function Kit.safe(f, ...)
+			local ok, a, b = pcall(f, ...)
+			if not ok then
+				Kit.lastError = tostring(a)
+				warn(TAG, "出错:", tostring(a))
+				-- 自动经验：报错原文进库（修法留空，等人/AI 补）
+				local L = Kit.learn
+				if L and L.auto then
+					L.add({
+						kind = "pitfall",
+						title = "运行报错: " .. normErr(a):sub(1, 70),
+						how = "自动记录（Kit.safe 捕获）",
+						fix = "待补：查 K86-K89 / PLAYBOOK 决策树",
+						tags = { "auto", "runtime" },
+					})
+				end
+			end
+			return ok, a, b
+		end
+		
+		function Kit.tail(n)
+			n = math.min(n or 20, #LINES)
+			local t = {}
+			for i = math.max(1, #LINES - n + 1), #LINES do t[#t + 1] = LINES[i] end
+			return t
+		end
+		
+		-- 真实时间（tempo 改变 os.clock 后，日志/测速仍要准，K85）
+		function Kit.clock()
+			local rec = Kit._tempo and Kit._tempo.rec
+			if rec and type(rec.raw) == "function" then return rec.raw() end
+			return os.clock()
+		end
+		
+		------------------------------------------------------------------ 2. 代际与单例
+		-- K40：旧实例的连接不随 GUI 销毁，必须用代际号让回调自sha
+		function Kit.guard(name)
+			local k = "__dawg_gen_" .. tostring(name)
+			local g = (tonumber(GENV[k]) or 0) + 1
+			GENV[k] = g
+			return g
+		end
+		
+		function Kit.alive(gen, name)
+			return tonumber(GENV["__dawg_gen_" .. tostring(name)]) == gen
+		end
+		
+		------------------------------------------------------------------ 3. 实例构造
+		-- K48：Instance.new 第二参数是 parent，不是属性表；Name 必须显式给
+		function Kit.new(class, props, parent)
+			local inst = Instance.new(class)
+			local p = parent
+			if props then
+				for k, v in pairs(props) do
+					if k == "Parent" then
+						p = p or v -- props 里给的 Parent 也要生效，否则层级静默丢失
+					else
+						inst[k] = v
+					end
+				end
+			end
+			if not props or props.Name == nil then
+				if inst.Name == class then inst.Name = class .. "_" .. tostring(math.random(1000, 9999)) end
+			end
+			if p then inst.Parent = p end
+			return inst
+		end
+		
+		------------------------------------------------------------------ 4. 名字匹配
+		-- K56：裸子串会命中 Banana / HitDetection，必须按 token 边界
+		function Kit.matchToken(name, kw)
+			local s, k = tostring(name):lower(), tostring(kw):lower()
+			if not string.find(k, "[^\0-\127]") then -- 中文/非 ASCII 直接子串
+				local i = 1
+				while true do
+					local a, b = string.find(s, k, i, true)
+					if not a then return false end
+					local pre  = a > 1 and string.sub(s, a - 1, a - 1) or ""
+					local post = b < #s and string.sub(s, b + 1, b + 1) or ""
+					-- 只把字母数字当词内字符；下划线算分隔（player_detect_v2 里的 detect 是独立词）
+					local function word(c) return c ~= "" and string.match(c, "[%a%d]") ~= nil end
+					if not word(pre) and not word(post) then return true end
+					i = a + 1
+				end
+			end
+			return string.find(s, k, 1, true) ~= nil
+		end
+		
+		------------------------------------------------------------------ 5. 探针
+		-- K22 / K69 / K85：三行探针定死架构，一次返回全部字段，省 5-10 轮往返
+		function Kit.probe(opts)
+			opts = opts or {}
+			local lp = Players.LocalPlayer
+			local ch = lp and lp.Character
+			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+			local anim = hum and hum:FindFirstChildOfClass("Animator")
+			local tool = ch and ch:FindFirstChildOfClass("Tool")
+		
+			local info = {
+				game = game.Name, place = game.PlaceId, job = game.JobId,
+				isClient = RunService:IsClient(),
+				character = ch and ch.Name or false,
+				hum  = hum and hum.WalkSpeed or false,
+				anim = anim and (safe(function() return #(anim:GetPlayingAnimationTracks()) end) or 0) or false,
+				tool = tool and true or false,
+				remoteCount = 0,
+			}
+			info.remoteCount = #Kit.remotes()
+		
+			if opts.verticals ~= false then
+				-- 判定是标准 3D 角色架构还是纯 UI 自研引擎
+				local humans, anims, models = 0, 0, 0
+				local scanned = 0
+				for _, d in ipairs(Workspace:GetDescendants()) do
+					scanned = scanned + 1
+					if d:IsA("Humanoid") then humans = humans + 1
+					elseif d:IsA("Animator") then anims = anims + 1
+					elseif d:IsA("Model") then models = models + 1 end
+					if scanned >= 4000 then break end
+				end
+				info.world = { humans = humans, anims = anims, models = models }
+				info.kind = (humans > 0 or anims > 0) and "3D-角色架构" or "纯 UI / 自研引擎（不要用 Humanoid/Animator/Tool 写法）"
+			end
+		
+			if opts.print ~= false then
+				print(string.format("[探针] %s | Place %d | HUM=%s ANIM=%s TOOL=%s | remote=%d | %s",
+					info.game, info.place, tostring(info.hum), tostring(info.anim),
+					tostring(info.tool), info.remoteCount, info.kind or "-"))
+			end
+			return info
+		end
+		
+		-- remote 清单（ReplicatedStorage + PlayerScripts + nil-parented）
+		function Kit.remotes(filter)
+			local out, seen = {}, {}
+			local roots = { game:GetService("ReplicatedStorage"), game:GetService("ReplicatedFirst") }
+			local lp = Players.LocalPlayer
+			local ps = lp and lp:FindFirstChild("PlayerScripts")
+			if ps then roots[#roots + 1] = ps end
+		
+			local function take(d)
+				if seen[d] then return end
+				seen[d] = true
+				local path = safe(function() return d:GetFullName() end) or d.Name
+				if filter and not string.find(string.lower(path), string.lower(tostring(filter)), 1, true) then return end
+				out[#out + 1] = { path = path, name = d.Name, class = d.ClassName, inst = d }
+			end
+		
+			for _, root in ipairs(roots) do
+				for _, d in ipairs(root:GetDescendants()) do
+					if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent") then take(d) end
+				end
+			end
+			local nilInsts = safe(function() return getnilinstances() end)
+			if nilInsts then
+				for _, d in ipairs(nilInsts) do
+					if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent") then take(d) end
+				end
+			end
+			return out
+		end
+		
+		-- K05 / K06 / K27：写一次 → 等 1 秒 → 读回，判定本地权威还是服务端覆盖
+		function Kit.authority(inst, prop, value, waitSec)
+			waitSec = waitSec or 1
+			local before = safe(function() return inst[prop] end)
+			if value ~= nil then
+				local ok = pcall(function() inst[prop] = value end) -- 某些 __newindex 会静默失败
+				if not ok then return { writable = false, before = before, verdict = "写入被拦截" } end
+			end
+			task.wait(waitSec)
+			local after = safe(function() return inst[prop] end)
+			local kept = value ~= nil and after == value or (value == nil and after == before)
+			return {
+				before = before, after = after, kept = kept, writable = true,
+				verdict = kept and "保持（客户端权威 / 或只是本地镜像，需对照服务端行为）" or "被覆写（服务端权威，别在这上面花时间）",
+			}
+		end
+		
+		------------------------------------------------------------------ 6. hook
+		local HOOKS = {}
+		Kit.hooks = HOOKS
+		
+		-- K34：引擎内部高频函数，hook 了就卡死
+		Kit.HOOK_DENY = {
+			["debug.info"] = "Roblox 内部高频调用，hook 后画面冻结",
+			["debug.traceback"] = "高频，且会污染调用栈",
+			["task.wait"] = "会破坏所有脚本的调度",
+			["os.time"] = "服务端时间语义，改了会让数据全判过期（K29 同类）",
+		}
+		
+		--- 装一个幂等 hook。
+		--- key    : 唯一名（重复调用直接返回旧记录，K25）
+		--- owner  : 函数所在表，如 os / 某个 Player 表
+		--- field  : 字段名
+		--- handler: function(raw, ...) → 返回值；raw 是 hookfunction 的返回值，K24
+		function Kit.hook(key, owner, field, handler)
+			if type(key) ~= "string" then error("Kit.hook: key 必须是字符串", 2) end
+			if HOOKS[key] then return HOOKS[key] end
+			if Kit.HOOK_DENY[key] or Kit.HOOK_DENY[field] then
+				Kit.log("拒绝 hook（黑名单）:", key, "—", Kit.HOOK_DENY[key] or Kit.HOOK_DENY[field])
+				return nil
+			end
+			local orig = owner and owner[field]
+			if type(orig) ~= "function" then
+				Kit.log("hook 目标不是函数:", key)
+				return nil
+			end
+			local hf = g("hookfunction")
+			if type(hf) ~= "function" then
+				Kit.log("当前环境没有 hookfunction（Studio/vanilla），跳过:", key) -- 降级不报错
+				return nil
+			end
+		
+			local raw
+			local wrapper = function(...) return handler(raw, ...) end
+			local nc = g("newcclosure")
+			local wrapped = (type(nc) == "function" and safe(nc, wrapper)) or wrapper
+			local ok, got = pcall(hf, orig, wrapped)
+			if not ok then
+				Kit.lastError = tostring(got)
+				Kit.log("hook 失败:", key, "—", tostring(got))
+				local L = Kit.learn
+				if L and L.auto then
+					L.add({
+						kind = "pitfall",
+						title = "hook 装不上（" .. tostring(got):sub(1, 40) .. "）",
+						how = "key=" .. tostring(key),
+						fix = "改事件驱动 / PreRender，别硬 hook（K87）",
+						tags = { "auto", "hook" },
+					})
+				end
+				return nil
+			end
+			raw = got -- K24：必须保存返回值，不能再用 orig
+		
+			-- K35：只信 pcall 成功，不比较函数对象
+			local rec = { key = key, raw = raw, orig = orig, owner = owner, field = field, active = true }
+			HOOKS[key] = rec
+			Kit.log("hook 已装:", key)
+			return rec
+		end
+		
+		--- K26：restorefunction 会弄坏 hook 链，面板里不要给「恢复」按钮。仅在调试用。
+		function Kit.unhook(key)
+			local rec = HOOKS[key]
+			if not rec then return false end
+			local ok = pcall(function() restorefunction(rec.raw, rec.orig) end)
+			if ok then HOOKS[key] = nil end
+			return ok
+		end
+		
+		--- K31：__namecall 会影响武器链路，默认不装；只在需要抓包时手动开
+		function Kit.hookNamecall(handler)
+			local hm = g("hookmetamethod")
+			local nc = g("newcclosure")
+			local cc = g("checkcaller")
+			if type(hm) ~= "function" then
+				Kit.log("没有 hookmetamethod，跳过 __namecall")
+				return nil
+			end
+			local wrap = function(self, ...)
+				local okName, name = pcall(getnamecallmethod)
+				if cc and not (safe(cc) or false) then
+					local ok, r = pcall(handler, okName and name or "?", self, ...)
+					if ok and r ~= nil then return r end
+				end
+				return nil
+			end
+			if type(nc) == "function" then
+				local ok, w = pcall(nc, wrap)
+				if ok and w then wrap = w end
+			end
+			local ok = pcall(hm, game, "__namecall", wrap)
+			return ok
+		end
+		
+		------------------------------------------------------------------ 7. 循环与连接管理
+		local CONNS = {}
+		Kit.conns = CONNS
+		
+		function Kit.track(conn)
+			CONNS[#CONNS + 1] = conn
+			return conn
+		end
+		
+		-- K74：task.spawn 返回的是 thread，不能 :Disconnect()，用标志位停
+		function Kit.loop(name, interval, fn)
+			local h = { name = name, running = true }
+			task.spawn(function()
+				while h.running do
+					local ok, err = pcall(fn)
+					if not ok then
+						Kit.lastError = tostring(err)
+						warn(TAG, "循环出错[" .. tostring(name) .. "]:", tostring(err))
+					end
+					task.wait(interval or 0)
+				end
+			end)
+			function h.stop() h.running = false end
+			return h
+		end
+		
+		------------------------------------------------------------------ 8. 点击补偿
+		-- K50 / K51 / K53：firesignal 首次无效；conns[1] 未必是目标；必须 task.spawn + 状态判定
+		function Kit.click(btn, changed, tries)
+			tries = tries or 3
+			local conns = safe(function() return getconnections(btn.MouseButton1Click) end)
+			if conns and #conns > 0 then
+				for i = 1, math.min(#conns, tries) do
+					local c = conns[i]
+					local f = c.Function or c.fn
+					if type(f) == "function" then
+						task.spawn(function() safe(f) end)
+					else
+						safe(function() c:Fire() end)
+					end
+					task.wait(0.03)
+					if changed and changed() then return true end
+				end
+				return false
+			end
+			-- 没有 getconnections（Studio）
+			local ok = pcall(function() btn:Click() end)
+			return ok
+		end
+		
+		------------------------------------------------------------------ 9. 时间变速
+		-- K02 / K29 / K38 / K39：只 hook os.clock；offset 上限 20 秒；不归零（归零会把冷却点推到未来）
+		local tempo = { offset = 0, rate = 1, limit = 20, rec = nil }
+		Kit._tempo = tempo
+		
+		function tempo.install()
+			if tempo.rec then return true end
+			tempo.rec = Kit.hook("os.clock", RENV.os, "clock", function(raw, ...)
+				local t = raw(...)
+				if tempo.rate ~= 1 then t = t * tempo.rate end
+				return t + tempo.offset
+			end)
+			return tempo.rec ~= nil
+		end
+		
+		function tempo.setOffset(v)
+			v = math.clamp(tonumber(v) or 0, -tempo.limit, tempo.limit) -- K38：32 秒就冻屏
+			tempo.offset = v
+			return v
+		end
+		
+		function tempo.freeze(sec)
+			tempo.install()
+			local stop = (Kit.clock()) + (sec or 5)
+			tempo.setOffset((tempo.offset + (sec or 5)))
+			-- 保持 offset 不归零（K39）；由调用方决定何时 tempo.reset
+			return { until_ = stop, stop = function() tempo.rate = 1 end }
+		end
+		
+		function tempo.reset()
+			tempo.offset = 0
+			tempo.rate = 1
+		end
+		
+		function tempo.status()
+			return { offset = tempo.offset, rate = tempo.rate, installed = tempo.rec ~= nil, limit = tempo.limit }
+		end
+		
+		Kit.tempo = tempo
+		
+		------------------------------------------------------------------ 10. 位移
+		-- K59：每帧现取，不缓存 Character
+		function Kit.hrp()
+			local lp = Players.LocalPlayer
+			local ch = lp and lp.Character
+			if not ch then return nil end
+			return ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart
+		end
+		
+		-- K12 / K17：Y 轴 MaxForce 给 0 才能水平加速；不用时销毁 BV，不要把 Velocity 设 0
+		function Kit.velocity(vec, opts)
+			opts = opts or {}
+			local hrp = opts.hrp or Kit.hrp()
+			if not hrp then return nil end
+			Kit.clearMovers(hrp)
+			local bv = Instance.new("BodyVelocity")
+			bv.Name = "__dawg_" .. tostring(opts.name or "vel")
+			bv.MaxForce = Vector3.new(1e6, opts.antiGravity and 0 or 1e6, 1e6)
+			bv.Velocity = vec
+			bv.Parent = hrp
+			return bv
+		end
+		
+		function Kit.clearMovers(hrp)
+			hrp = hrp or Kit.hrp()
+			if not hrp then return end
+			for _, c in ipairs(hrp:GetChildren()) do
+				if c:IsA("BodyMover") and string.sub(c.Name, 1, 7) == "__dawg_" then
+					pcall(function() c:Destroy() end)
+				end
 			end
 		end
-	end)
+		
+		-- K08 / K13：小步 CFrame 才不会被拉回；上升阶段跳过，否则跳跃被清零
+		function Kit.step(offset, stepLen)
+			local hrp = Kit.hrp()
+			if not hrp then return false end
+			local hum = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
+			if hum and (hum:GetState() == Enum.HumanoidStateType.Jumping or hrp.AssemblyLinearVelocity.Y > 1) then
+				return false
+			end
+			stepLen = stepLen or 1
+			local d = offset.Magnitude > stepLen and offset.Unit * stepLen or offset
+			hrp.CFrame = hrp.CFrame + d
+			return true
+		end
+		
+		------------------------------------------------------------------ 11. getgc 分批扫描
+		-- K58：全量 getgc 冻结主线程 —— 必须 islclosure 粗筛 + 分批让出 + 上限 + 进度
+		function Kit.gcScan(pred, opts)
+			opts = opts or {}
+			local gc = safe(function() return getgc(true) end)
+			if not gc then return {} end
+			local limit = opts.limit or 5000
+			local batch = opts.batch or 200
+			local out, scanned, hit = {}, 0, 0
+			for _, v in ipairs(gc) do
+				if typeof(v) == "function" and safe(function() return islclosure(v) end) then
+					scanned = scanned + 1
+					local ok, keep = pcall(pred, v)
+					if ok and keep then
+						hit = hit + 1
+						out[hit] = v
+					end
+					if scanned >= limit then break end
+					if scanned % batch == 0 then
+						if opts.progress then safe(opts.progress, scanned, limit, hit) end
+						task.wait()
+					end
+				end
+			end
+			return out
+		end
+		
+		------------------------------------------------------------------ 12. 持久化
+		-- K60 / K64：存配置；Studio 走 plugin:SetSetting，executor 走 writefile
+		function Kit.save(file, tbl)
+			local ok, json = pcall(function() return HttpService:JSONEncode(tbl) end)
+			if not ok then return false end
+			local wf = g("writefile")
+			if type(wf) == "function" then
+				return (pcall(wf, file, json))
+			end
+			local plug = g("plugin")
+			if plug and plug.SetSetting then
+				return (pcall(function() plug:SetSetting(file, json) end))
+			end
+			return false
+		end
+		
+		function Kit.load(file, default)
+			local raw
+			local rf = g("readfile")
+			if type(rf) == "function" then
+				if not (safe(function() return isfile(file) end) or false) then return default end
+				raw = safe(rf, file)
+			else
+				local plug = g("plugin")
+				if plug and plug.GetSetting then
+					raw = safe(function() return plug:GetSetting(file) end)
+				end
+			end
+			if type(raw) ~= "string" or raw == "" then return default end
+			local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+			return ok and data or default
+		end
+		
+		------------------------------------------------------------------ 13. 突破实验台
+		-- 原则：不预设上限。先量化测，达标才算；单轮有硬超时，没提升就换下一条，不死磕。
+		local lab = {}
+		Kit.lab = lab
+		
+		--- 单轮实验：duration 秒内反复执行 action，用 sense 的差值算「服务端接受」
+		--- sense 必须是「累计值读取器」（例如命中计数），返回数字
+		function lab.trial(name, action, sense, opts)
+			opts = opts or {}
+			local duration = opts.duration or 3
+			local gap = opts.gap or 0.05
+			local settle = opts.settle or 0.4
+			local before = sense and (tonumber(safe(sense)) or 0) or nil
+			local t0 = Kit.clock()
+			local attempts = 0
+			while Kit.clock() - t0 < duration do
+				if pcall(action, attempts + 1) then attempts = attempts + 1 end
+				task.wait(gap)
+			end
+			if settle > 0 then task.wait(settle) end
+			local after = sense and (tonumber(safe(sense)) or 0) or nil
+			local accepted = (before and after) and math.max(0, after - before) or 0
+			local row = {
+				name = name, attempts = attempts, accepted = accepted,
+				rate = attempts > 0 and accepted / attempts or 0,
+				sendPerSec = attempts / duration,
+				acceptPerSec = accepted / duration,
+			}
+			Kit.log(string.format("[实验] %-22s 发 %d 收 %d | %.2f/s 接受率 %.0f%%",
+				name, attempts, accepted, row.acceptPerSec, row.rate * 100))
+			return row
+		end
+		
+		--- 梯度扫描：同一动作换不同参数跑一轮，按「每秒接受」排序，直接给最优
+		--- opts.gapFor(v) 可让每轮用不同发包间隔（扫节奏必备）
+		function lab.sweep(name, values, opts)
+			opts = opts or {}
+			local rows = {}
+			for _, v in ipairs(values) do
+				if opts.setup then pcall(opts.setup, v) end
+				local sub = {}
+				for k, val in pairs(opts) do sub[k] = val end
+				if opts.gapFor then sub.gap = opts.gapFor(v) end
+				local row = lab.trial(name .. "=" .. tostring(v),
+					function(i) return opts.action(v, i) end, opts.sense, sub)
+				row.value = v
+				rows[#rows + 1] = row
+			end
+			table.sort(rows, function(a, b) return a.acceptPerSec > b.acceptPerSec end)
+			if rows[1] then
+				Kit.log(string.format("[实验] 最优 %s = %s（%.2f/s）", name, tostring(rows[1].value), rows[1].acceptPerSec))
+			end
+			return rows[1], rows
+		end
+		
+		--- 方案链：按顺序试，第一个达标立刻停；全不达标返回 winner = nil
+		--- candidates = { { label = "A 多入口并行", run = function() return 刀每秒 end, target = 2.0 }, ... }
+		function lab.plan(name, candidates, opts)
+			local rows = {}
+			for _, c in ipairs(candidates) do
+				if opts and opts.between then task.wait(opts.between) end
+				local ok, m = pcall(c.run)
+				m = ok and tonumber(m) or nil
+				local hit = ok and (not c.target or (m or 0) >= c.target)
+				rows[#rows + 1] = { label = c.label, metric = m, target = c.target, ok = hit }
+				Kit.log(string.format("[方案] %s → %s %s（%s / 门槛 %s）",
+					name, c.label, hit and "达标" or "不行，换下一条",
+					m and string.format("%.2f", m) or "n/a", tostring(c.target or "-")))
+				if hit then return { winner = c.label, metric = m, rows = rows } end
+			end
+			return { winner = nil, rows = rows }
+		end
+		
+		--- 通道聚类：找「同语义不同入口」。每个 remote 往往独立限流，多路并行才是真的突破点
+		function lab.channels(filter)
+			local groups = {}
+			for _, r in ipairs(Kit.remotes(filter)) do
+				local root = string.lower(r.name)
+				root = root:gsub("%d+$", ""):gsub("remote", ""):gsub("event", ""):gsub("request", ""):gsub("client", "")
+				groups[root] = groups[root] or {}
+				table.insert(groups[root], r)
+			end
+			local out = {}
+			for k, v in pairs(groups) do out[#out + 1] = { root = k, count = #v, list = v } end
+			table.sort(out, function(a, b) return a.count > b.count end)
+			return out
+		end
+		
+		--- 时序探测：RTT 抖动决定「卡锁边界发包」值不值得做（抖动 < 20ms 才有戏）
+		function lab.clockProbe(rounds)
+			rounds = rounds or 6
+			local samples = {}
+			for _ = 1, rounds do
+				local t0 = Kit.clock()
+				local st = safe(function() return Workspace:GetServerTimeNow() end)
+				local t1 = Kit.clock()
+				if st then samples[#samples + 1] = { rtt = t1 - t0, server = st } end
+				task.wait(0.08)
+			end
+			local sum, mn, mx = 0, math.huge, 0
+			for _, s in ipairs(samples) do
+				sum = sum + s.rtt
+				mn = math.min(mn, s.rtt)
+				mx = math.max(mx, s.rtt)
+			end
+			local avg = #samples > 0 and sum / #samples or 0
+			local out = { samples = samples, avg = avg, min = mn, max = mx, jitter = (#samples > 0) and (mx - mn) or 0 }
+			Kit.log(string.format("[时序] RTT avg %.1fms jitter %.1fms → 边界发包 %s",
+				avg * 1000, out.jitter * 1000, out.jitter < 0.02 and "值得试" or "抖动太大，别钻"))
+			return out
+		end
+		
+		--- 压门：一直挂在门口发，解锁瞬间被接住（K01 的结论落地，属于「喂满」不是「突破」）
+		function lab.pushQueue(fire, gap, sense)
+			local st = { sent = 0, accepted = 0, running = true }
+			local before = sense and (tonumber(safe(sense)) or 0) or 0
+			task.spawn(function()
+				while st.running do
+					if pcall(fire, st.sent + 1) then st.sent = st.sent + 1 end
+					task.wait(gap or 0.04)
+				end
+				if sense then st.accepted = math.max(0, (tonumber(safe(sense)) or 0) - before) end
+			end)
+			function st.stop(reason)
+				st.running = false
+				if reason then Kit.log("压门停止:", reason) end
+			end
+			return st
+		end
+		
+		--- 写属性对抗：每帧写回，看能不能压住引擎/服务端覆写（K10 的实验版）
+		function lab.fightProperty(inst, prop, value, opts)
+			opts = opts or {}
+			local duration = opts.duration or 3
+			local hz = opts.hz or 60
+			local writes = 0
+			local deadline = Kit.clock() + duration
+			local h = Kit.loop("fight:" .. tostring(prop), 1 / hz, function()
+				if Kit.clock() > deadline then return end
+				pcall(function() inst[prop] = value end)
+				writes = writes + 1
+			end)
+			task.wait(duration + 0.3)
+			h.stop()
+			local final = safe(function() return inst[prop] end)
+			local kept = final == value
+			Kit.log(string.format("[实验] 重写 %s = %s ×%d 次 → 最终 %s（%s）",
+				tostring(prop), tostring(value), writes, tostring(final), kept and "压住了" or "被覆写"))
+			return { writes = writes, final = final, kept = kept }
+		end
+		
+		------------------------------------------------------------------ 14. UI
+		local UI = {}
+		UI.__index = UI
+		
+		--- 建一个面板。cfg = { title, width, hotkey, position }
+		function Kit.ui(cfg)
+			cfg = cfg or {}
+			local self = setmetatable({}, UI)
+			self.gen = Kit.guard("ui")
+			self.order = 0
+			self.conns = {}
+			self.controls = {}
+		
+			local gui = Kit.new("ScreenGui", {
+				Name = "DawgKit_UI",
+				ResetOnSpawn = false,
+				IgnoreGuiInset = true,
+				ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+				DisplayOrder = 1e6, -- K46：游戏有 1000，必须压过
+			})
+			-- K46：先 CoreGui，失败退 gethui，再退 PlayerGui；每一层都要 pcall
+			-- （普通脚本往 CoreGui 塞东西会抛 "Parent property is locked"）
+			local coreGui = safe(function() return game:GetService("CoreGui") end)
+			local mounted = coreGui ~= nil and (pcall(function() gui.Parent = coreGui end) or gui.Parent ~= nil)
+			if not mounted and HUI and HUI ~= coreGui then
+				pcall(function() gui.Parent = HUI end)
+			end
+			if gui.Parent == nil then
+				local lp = Players.LocalPlayer
+				local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
+				if pg then pcall(function() gui.Parent = pg end) end
+			end
+			if gui.Parent == nil then
+				Kit.log("没有可挂载的容器（CoreGui / gethui / PlayerGui 全部不可写）")
+			end
+		
+			local W = cfg.width or 226
+			-- K45：坐标系已含内缩，只用 AnchorPoint 贴左下角，不做 +58 补偿
+			local panel = Kit.new("Frame", {
+				Name = "Panel",
+				Size = UDim2.fromOffset(W, cfg.height or 264),
+				AnchorPoint = Vector2.new(0, 1),
+				Position = cfg.position or UDim2.new(0, 20, 1, -20),
+				BackgroundColor3 = Color3.fromRGB(20, 21, 26),
+				BackgroundTransparency = 0.08,
+				BorderSizePixel = 0,
+				Active = true,
+				ZIndex = 50,
+			}, gui)
+			Kit.new("UICorner", { CornerRadius = UDim.new(0, 10) }, panel)
+			local stroke = Kit.new("UIStroke", {
+				Color = Color3.fromRGB(255, 175, 45), Thickness = 1, Transparency = 0.45,
+			}, panel)
+		
+			local bar = Kit.new("Frame", {
+				Name = "TitleBar", Size = UDim2.new(1, 0, 0, 30),
+				BackgroundColor3 = Color3.fromRGB(32, 33, 40), BackgroundTransparency = 0.12,
+				BorderSizePixel = 0, ZIndex = 51,
+			}, panel)
+			Kit.new("UICorner", { CornerRadius = UDim.new(0, 10) }, bar)
+		
+			local title = Kit.new("TextLabel", {
+				Name = "Title", Size = UDim2.new(1, -36, 1, 0), Position = UDim2.fromOffset(12, 0),
+				BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 13,
+				TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = Color3.fromRGB(240, 240, 245),
+				Text = cfg.title or "DawgKit", ZIndex = 52,
+			}, bar)
+		
+			local closeBtn = Kit.new("TextButton", {
+				Name = "Close", Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, -30, 0, 3),
+				BackgroundColor3 = Color3.fromRGB(58, 40, 44), BorderSizePixel = 0,
+				AutoButtonColor = false, Font = Enum.Font.GothamBold, TextSize = 14,
+				TextColor3 = Color3.fromRGB(255, 140, 140), Text = "×", ZIndex = 52,
+			}, bar)
+			Kit.new("UICorner", { CornerRadius = UDim.new(0, 6) }, closeBtn)
+		
+			local body = Kit.new("ScrollingFrame", {
+				Name = "Body", Size = UDim2.new(1, -12, 1, -42), Position = UDim2.fromOffset(6, 36),
+				BackgroundTransparency = 1, BorderSizePixel = 0,
+				ScrollBarThickness = 4, ScrollBarImageColor3 = Color3.fromRGB(90, 92, 102),
+				CanvasSize = UDim2.new(0, 0, 0, 0),
+				AutomaticCanvasSize = Enum.AutomaticSize.Y, -- K44：不手算高度
+				ZIndex = 51,
+			}, panel)
+			Kit.new("UIListLayout", {
+				SortOrder = Enum.SortOrder.LayoutOrder, -- K41：默认按 Name 排会乱
+				Padding = UDim.new(0, 6),
+			}, body)
+		
+			local openBtn = Kit.new("TextButton", {
+				Name = "Open", Size = UDim2.fromOffset(54, 34),
+				AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 20, 1, -20),
+				BackgroundColor3 = Color3.fromRGB(20, 21, 26), BackgroundTransparency = 0.08,
+				BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBold,
+				TextSize = 12, TextColor3 = Color3.fromRGB(255, 175, 45), Text = "Dawg",
+				Visible = false, ZIndex = 60,
+			}, gui)
+			Kit.new("UICorner", { CornerRadius = UDim.new(0, 8) }, openBtn)
+		
+			self.gui, self.panel, self.body = gui, panel, body
+			self.stroke, self.openBtn = stroke, openBtn
+			GENV.__dawg_ui = self -- K60：旧句柄留在全局，下次注入先 destroy
+		
+			local function nextOrder()
+				self.order = self.order + 1
+				return self.order
+			end
+			self._nextOrder = nextOrder
+		
+			------------------------------------------------ 控件工厂
+			function self:section(text)
+				local f = Kit.new("Frame", {
+					Name = "Section_" .. tostring(text), Size = UDim2.new(1, 0, 0, 20),
+					BackgroundTransparency = 1, ZIndex = 52, LayoutOrder = nextOrder(),
+				}, body)
+				Kit.new("TextLabel", {
+					Name = "Label", Size = UDim2.new(1, -4, 1, -4), Position = UDim2.fromOffset(4, 2),
+					BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 11,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					TextColor3 = Color3.fromRGB(255, 175, 45), Text = text, ZIndex = 52,
+				}, f)
+				return f
+			end
+		
+			-- K47：开关只有一个 setter，按钮/热键/代码全走它，且幂等
+			function self:toggle(text, default, cb)
+				local parent = self.body
+				local row = Kit.new("Frame", {
+					Name = "Toggle_" .. tostring(text), Size = UDim2.new(1, 0, 0, 28),
+					BackgroundTransparency = 1, ZIndex = 52, LayoutOrder = nextOrder(),
+				}, parent)
+		
+				local lab = Kit.new("TextLabel", {
+					Name = "Label", Size = UDim2.new(1, -56, 1, 0), BackgroundTransparency = 1,
+					Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+					TextColor3 = Color3.fromRGB(214, 216, 224), Text = text, ZIndex = 52,
+				}, row)
+		
+				local btn = Kit.new("TextButton", {
+					Name = "ToggleBtn", Size = UDim2.fromOffset(48, 22),
+					Position = UDim2.new(1, -48, 0.5, -11), BorderSizePixel = 0,
+					AutoButtonColor = false, Font = Enum.Font.GothamBold, TextSize = 11,
+					Text = "", ZIndex = 52,
+				}, row)
+				Kit.new("UICorner", { CornerRadius = UDim.new(1, 0) }, btn)
+		
+				local state = { on = default and true or false }
+				local ctl = { state = state, btn = btn, label = lab }
+		
+				local function paint()
+					btn.BackgroundColor3 = state.on and Color3.fromRGB(38, 120, 68) or Color3.fromRGB(56, 57, 64)
+					btn.TextColor3 = state.on and Color3.fromRGB(235, 245, 235) or Color3.fromRGB(170, 172, 180)
+					btn.Text = state.on and "ON" or "OFF"
+				end
+		
+				function ctl.set(v, silent)
+					v = v and true or false
+					if state.on == v then return end -- 幂等
+					state.on = v
+					paint()
+					if not silent and cb then task.spawn(function() safe(cb, v) end) end
+				end
+				function ctl.get() return state.on end
+		
+				paint()
+				local c = btn.MouseButton1Click:Connect(function()
+					if not Kit.alive(self.gen, "ui") then return end
+					ctl.set(not state.on)
+				end)
+				self.conns[#self.conns + 1] = c
+				self.controls[#self.controls + 1] = ctl
+				return ctl
+			end
+		
+			function self:button(text, cb)
+				local b = Kit.new("TextButton", {
+					Name = "Btn_" .. tostring(text), Size = UDim2.new(1, 0, 0, 28),
+					BackgroundColor3 = Color3.fromRGB(40, 42, 50), BorderSizePixel = 0,
+					AutoButtonColor = false, Font = Enum.Font.GothamBold, TextSize = 12,
+					TextColor3 = Color3.fromRGB(220, 222, 230), Text = text,
+					ZIndex = 52, LayoutOrder = nextOrder(),
+				}, self.body)
+				Kit.new("UICorner", { CornerRadius = UDim.new(0, 8) }, b)
+				local c = b.MouseButton1Click:Connect(function()
+					if not Kit.alive(self.gen, "ui") then return end
+					task.spawn(function() safe(cb) end)
+				end)
+				self.conns[#self.conns + 1] = c
+				return b
+			end
+		
+			function self:label(text, size)
+				local l = Kit.new("TextLabel", {
+					Name = "Label", Size = UDim2.new(1, 0, 0, size or 18), BackgroundTransparency = 1,
+					Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+					TextColor3 = Color3.fromRGB(150, 152, 162), Text = text or "", TextWrapped = true,
+					ZIndex = 52, LayoutOrder = nextOrder(),
+				}, self.body)
+				return l
+			end
+		
+			-- 步进器：− 值 +（比滑块省 3 倍代码，够用）
+			function self:stepper(text, min, max, step, default, cb)
+				local row = Kit.new("Frame", {
+					Name = "Step_" .. tostring(text), Size = UDim2.new(1, 0, 0, 28),
+					BackgroundTransparency = 1, ZIndex = 52, LayoutOrder = nextOrder(),
+				}, self.body)
+				Kit.new("TextLabel", {
+					Name = "Label", Size = UDim2.new(1, -104, 1, 0), BackgroundTransparency = 1,
+					Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+					TextColor3 = Color3.fromRGB(214, 216, 224), Text = text, ZIndex = 52,
+				}, row)
+				local minus = Kit.new("TextButton", {
+					Name = "Minus", Size = UDim2.fromOffset(24, 22), Position = UDim2.new(1, -100, 0.5, -11),
+					BackgroundColor3 = Color3.fromRGB(48, 50, 58), BorderSizePixel = 0, AutoButtonColor = false,
+					Font = Enum.Font.GothamBold, TextSize = 13, Text = "-", TextColor3 = Color3.fromRGB(220, 222, 230), ZIndex = 52,
+				}, row)
+				local val = Kit.new("TextLabel", {
+					Name = "Value", Size = UDim2.fromOffset(44, 22), Position = UDim2.new(1, -74, 0.5, -11),
+					BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 12,
+					TextColor3 = Color3.fromRGB(255, 175, 45), Text = tostring(default or min), ZIndex = 52,
+				}, row)
+				local plus = Kit.new("TextButton", {
+					Name = "Plus", Size = UDim2.fromOffset(24, 22), Position = UDim2.new(1, -26, 0.5, -11),
+					BackgroundColor3 = Color3.fromRGB(48, 50, 58), BorderSizePixel = 0, AutoButtonColor = false,
+					Font = Enum.Font.GothamBold, TextSize = 13, Text = "+", TextColor3 = Color3.fromRGB(220, 222, 230), ZIndex = 52,
+				}, row)
+				for _, b in ipairs({ minus, plus }) do
+					Kit.new("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+				end
+		
+				local cur = default or min
+				local function apply(v, silent)
+					cur = math.clamp(v, min, max)
+					val.Text = string.format("%.2f", cur)
+					if not silent and cb then task.spawn(function() safe(cb, cur) end) end
+				end
+				apply(cur, true)
+				local c1 = minus.MouseButton1Click:Connect(function()
+					if Kit.alive(self.gen, "ui") then apply(cur - step) end
+				end)
+				local c2 = plus.MouseButton1Click:Connect(function()
+					if Kit.alive(self.gen, "ui") then apply(cur + step) end
+				end)
+				self.conns[#self.conns + 1] = c1
+				self.conns[#self.conns + 1] = c2
+				return { get = function() return cur end, set = apply }
+			end
+		
+			------------------------------------------------ 关闭 / 重开 / 热键
+			local cClose = closeBtn.MouseButton1Click:Connect(function()
+				if not Kit.alive(self.gen, "ui") then return end
+				panel.Visible = false
+				openBtn.Visible = true
+			end)
+			local cOpen = openBtn.MouseButton1Click:Connect(function()
+				if not Kit.alive(self.gen, "ui") then return end
+				panel.Visible = true
+				openBtn.Visible = false
+			end)
+			self.conns[#self.conns + 1] = cClose
+			self.conns[#self.conns + 1] = cOpen
+		
+			-- K46 热键兜底：被别的界面压住时 still 能收放
+			local hk = cfg.hotkey or Enum.KeyCode.RightShift
+			local cHot = UIS.InputBegan:Connect(function(input, gp)
+				if gp then return end
+				if not Kit.alive(self.gen, "ui") then return end
+				if input.KeyCode == hk then
+					panel.Visible = not panel.Visible
+					openBtn.Visible = not panel.Visible
+				end
+			end)
+			self.conns[#self.conns + 1] = cHot
+		
+			------------------------------------------------ 拖动（K54 / K55：手写，5px 阈值）
+			local dragging, dragStart, startPos, moved = false, nil, nil, 0
+			local cBarBegin = bar.InputBegan:Connect(function(input)
+				if not Kit.alive(self.gen, "ui") then return end
+				if input.UserInputType == Enum.UserInputType.MouseButton1
+					or input.UserInputType == Enum.UserInputType.Touch then
+					dragging = true
+					dragStart = input.Position
+					startPos = panel.Position
+					moved = 0
+					input.Changed:Connect(function()
+						if input.UserInputState == Enum.UserInputState.End then dragging = false end
+					end)
+				end
+			end)
+			local cEnd = UIS.InputEnded:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1
+					or input.UserInputType == Enum.UserInputType.Touch then
+					dragging = false
+				end
+			end)
+			local cMove = UIS.InputChanged:Connect(function(input)
+				if not Kit.alive(self.gen, "ui") then return end
+				if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+					or input.UserInputType == Enum.UserInputType.Touch) then
+					local d = input.Position - dragStart
+					moved = math.max(moved, d.Magnitude)
+					if moved > 5 then
+						panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+							startPos.Y.Scale, startPos.Y.Offset + d.Y)
+					end
+				end
+			end)
+			self.conns[#self.conns + 1] = cBarBegin
+			self.conns[#self.conns + 1] = cEnd
+			self.conns[#self.conns + 1] = cMove
+		
+			function self:destroy()
+				for _, c in ipairs(self.conns) do pcall(function() c:Disconnect() end) end
+				self.conns = {}
+				pcall(function() gui:Destroy() end)
+				self.gui = nil
+			end
+		
+			function self:setVisible(v)
+				panel.Visible = v and true or false
+				openBtn.Visible = not panel.Visible
+			end
+		
+			return self
+		end
+		
+		------------------------------------------------------------------ 15. 自举
+		--- 一键自举：探针 → 面板 → 全局注册。插件 / autoexec 只调这一个函数。
+		--- opts = { title, width, hotkey, probe = true, printProbe = true, ui = true, onReady = fn }
+		--- 用法：Kit.mount()  之后任何脚本都能 getgenv().DawgKit 拿到库
+		function Kit.mount(opts)
+			opts = opts or {}
+			local out = { kit = Kit, version = Kit.version }
+		
+			-- 1. 全局注册，后续脚本不用再 loadstring
+			GENV.__DAWG_KIT = Kit
+			GENV.DawgKit = Kit
+			_G.DawgKit = Kit
+		
+			-- 2. 探针（默认打印一行，省一次手动调用）
+			if opts.probe ~= false then
+				local ok, p = pcall(Kit.probe, { print = opts.printProbe ~= false })
+				out.probe = ok and p or nil
+			end
+		
+			-- 3. 面板：探针结果直接落在第一屏
+			if opts.ui ~= false then
+				local ok, ui = pcall(Kit.ui, { title = opts.title or "DawgKit", width = opts.width, hotkey = opts.hotkey })
+				if ok and ui then
+					local p = out.probe
+					ui:section("环境")
+					ui:label(p and string.format("%s · Place %d · remote %d", tostring(p.game), p.place, p.remoteCount)
+						or "（无探针数据）", 16)
+					if p then
+						ui:label(string.format("HUM=%s ANIM=%s TOOL=%s", tostring(p.hum), tostring(p.anim), tostring(p.tool)), 16)
+						if p.kind then ui:label(p.kind, 30) end
+					end
+					ui:section("工具")
+					ui:button("重新探针", function() Kit.probe() end)
+					ui:button("列出 remote", function()
+						for _, r in ipairs(Kit.remotes()) do Kit.log(r.class, r.path) end
+					end)
+					ui:button("打印最近日志", function()
+						for _, l in ipairs(Kit.tail(15)) do print(l) end
+					end)
+					ui:button("卸载面板", function() ui:destroy() end)
+					out.ui = ui
+				else
+					Kit.log("面板创建失败（插件环境没有 PlayerGui 属正常）：", tostring(ui))
+				end
+			end
+		
+			if opts.onReady then
+				task.spawn(function() safe(opts.onReady, out) end)
+			end
+			Kit.log("mount 完成 · v" .. Kit.version)
+			return out
+		end
+		
+		------------------------------------------------------------------ 15.5 反作弊预检（ac）
+		-- 动手写功能之前先扫一遍：知道它盯什么，才知道哪些路不能走。
+		-- 只读扫描，不 hook、不改环境（K31/K32 的教训）。
+		local ac = { patterns = {
+			-- 只放「不会误伤零件名」的词：Triggerguard / Handguard 这种不能算
+			"voltils", "anti cheat", "anticheat", "anti-cheat", "antiskid", "anti skid",
+			"anticheatservice", "sentinel", "safeguard module", "validator",
+			"kickplayer", "banplayer", "kick log", "ban log", "detection",
+		} }
+		Kit.ac = ac
+		
+		local function hitsIn(name)
+			local ln = string.lower(tostring(name))
+			for _, p in ipairs(ac.patterns) do
+				if string.find(ln, p, 1, true) then return p end
+			end
+		end
+		
+		--- 扫客户端能看到的所有反作弊痕迹（脚本名 + 远程/容器名）
+		function ac.scan(opts)
+			opts = opts or {}
+			local hits, checked = {}, 0
+			local sc = rawget(_G, "getscripts")
+			if type(sc) ~= "function" then sc = GENV.getscripts end
+			if type(sc) == "function" then
+				local ok, list = pcall(sc)
+				if ok then
+					for _, s2 in ipairs(list) do
+						checked = checked + 1
+						local okN, path = pcall(function() return s2:GetFullName() end)
+						local okName, nm = pcall(function() return s2.Name end)
+						if okN and path then
+							local p = hitsIn(okName and nm or path)
+							if p then hits[#hits + 1] = { kind = "script", path = path, pattern = p } end
+						end
+					end
+				end
+			end
+			-- 只扫有意义的东西：脚本、远程、容器；BasePart/Weld 之类（扳机护圈、护木）一律跳过
+			local function interesting(d)
+				return d:IsA("LuaSourceContainer") or d:IsA("RemoteEvent") or d:IsA("RemoteFunction")
+					or d:IsA("UnreliableRemoteEvent") or d:IsA("Folder") or d:IsA("ScreenGui")
+			end
+			for _, svc in ipairs({ game:GetService("ReplicatedStorage"), game:GetService("ReplicatedFirst") }) do
+				for _, d in ipairs(svc:GetDescendants()) do
+					if interesting(d) then
+						local p = hitsIn(d.Name)
+						if p then hits[#hits + 1] = { kind = d.ClassName, path = d:GetFullName(), pattern = p } end
+					end
+				end
+			end
+			local level = (#hits == 0) and "none" or (#hits < 3 and "low" or "high")
+			if opts.print ~= false then
+				Kit.log(string.format("反作弊预检：%s（脚本 %d 个，命中 %d 处）", level, checked, #hits))
+				for i = 1, math.min(#hits, 8) do
+					print(string.format("  [%s] %s  ← %s", hits[i].kind, hits[i].path, hits[i].pattern))
+				end
+			end
+			return { level = level, hits = hits, checked = checked }
+		end
+		
+		--- 运行时自保：扫完直接把策略定下来，脚本按这个跑，不用人判断
+		--- 返回 { safeMode, allowNamecallHook, maxSendHz, notes }
+		function ac.harden(opts)
+			local res = ac.scan({ print = false })
+			local level = res.level
+			local pol = {
+				level = level,
+				safeMode = (level ~= "none"),
+				allowNamecallHook = (level == "none"),
+				maxSendHz = (level == "none") and 10 or (level == "low" and 8 or 5),
+				notes = {},
+			}
+			for _, h in ipairs(res.hits) do
+				local l = string.lower(h.pattern)
+				if l == "voltils" or l == "antiskid" or l == "anti skid" then
+					pol.notes[#pol.notes + 1] = "Voltils：不代理环境、不 hook __namecall"
+				elseif string.find(l, "kick", 1, true) or string.find(l, "ban", 1, true) then
+					pol.notes[#pol.notes + 1] = "有踢人通道：发包降到 " .. pol.maxSendHz .. "Hz"
+				end
+			end
+			Kit.acPolicy = pol
+			if opts and opts.print ~= false then
+				Kit.log(string.format("自保：level=%s safeMode=%s maxSendHz=%d%s",
+					level, tostring(pol.safeMode), pol.maxSendHz,
+					#pol.notes > 0 and (" | " .. table.concat(pol.notes, "；")) or ""))
+			end
+			return pol
+		end
+		
+		--- 基于扫描结果给施工建议（这些是踩过的，不是通用废话）
+		function ac.advise(res)
+			res = res or ac.scan({ print = false })
+			local tips, seen = {}, {}
+			local function add(t)
+				if seen[t] then return end
+				seen[t] = true
+				tips[#tips + 1] = t
+			end
+			if res.level == "none" then
+				add("没扫到明显反作弊：仍按「不高频发包、不碰元表」写，别赌")
+			else
+				add("有检测：先按它盯的面设计，再写功能（顺序反了要重写）")
+			end
+			for _, h in ipairs(res.hits) do
+				local l = string.lower(h.pattern)
+				if l == "voltils" or l == "antiskid" or l == "anti skid" then
+					add("Voltils 系：检测代码结构与环境代理 → 不 setfenv、不代理 _ENV（K32），走包装层")
+				elseif l == "kick" or l == "ban" then
+					add("有踢人/封禁通道：先看它由什么触发（校验/速度/异常包），别压满限流")
+				elseif l == "trap" or l == "shield" or l == "guard" then
+					add("有守卫脚本：避免无意义的高频轮询与属性轰炸"
+						.. "（每帧全量扫、每帧写属性都会被看到）")
+				end
+			end
+			add("通用：不 hook __namecall / 不碰实例元表（K31/K87）；要动相机用 PreRender（K90）")
+			add("通用：发包频率跟游戏原生一致，别 60Hz 硬刷（K88）")
+			if Kit.env.isExecutor and not Kit.env.hasConn then
+				add("本环境没有 getconnections，别设计依赖连接禁用的方案")
+			end
+			return tips
+		end
+		
+		------------------------------------------------------------------ 15.6 UI 库（WindUI）
+		-- 约定：以后脚本 UI 默认用 WindUI（Footagesus/WindUI），本地 vendor 优先，避免连不上。
+		GENV_CACHE = GENV_CACHE or GENV
+		local WINDUI_LOCAL = { "vendor/WindUI.lua", "WindUI.lua", "vendor/main.lua" }
+		local WINDUI_URL = "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
+		
+		function Kit.windui(opts)
+			opts = opts or {}
+			local cached = rawget(GENV_CACHE or {}, "__WINDUI_LIB")
+			if cached then return cached end
+		
+			local rf = g("readfile")
+			if type(rf) == "function" then
+				for _, path in ipairs(WINDUI_LOCAL) do
+					local ok, src = pcall(rf, path)
+					if ok and type(src) == "string" and #src > 1000 then
+						local chunk = loadstring(src, "@WindUI")
+						if chunk then
+							local ok2, lib = pcall(chunk)
+							if ok2 and type(lib) == "table" then
+								GENV_CACHE.__WINDUI_LIB = lib
+								return lib
+							end
+						end
+					end
+				end
+			end
+		
+			if opts.offlineOnly then
+				Kit.log("WindUI：本地副本没找到，且要求离线")
+				return nil
+			end
+			local ok, lib = pcall(function()
+				return loadstring(game:HttpGet(WINDUI_URL))()
+			end)
+			if ok and type(lib) == "table" then
+				GENV_CACHE.__WINDUI_LIB = lib
+				Kit.log("WindUI：本地没有，已从 GitHub 拉取（建议存一份到 vendor/）")
+				return lib
+			end
+			Kit.log("WindUI 加载失败：", tostring(lib))
+			return nil
+		end
+		
+		------------------------------------------------------------------ 15.7 功能管理（feat）
+		-- 功能不写死在面板里：注册 → 自动生成控件 → 可增可减可关。
+		-- 想让某个功能消失就 feat.remove(id)，UI 下次重建时自然没有它。
+		local feat = { items = {}, order = {} }
+		Kit.feat = feat
+		
+		--- 注册一个功能：{ id, name, desc, default, on(v), off(v) }
+		function feat.register(def)
+			if type(def) ~= "table" or not def.id then return nil end
+			local exist = feat.items[def.id]
+			if exist then return exist end
+			local item = {
+				id = def.id,
+				name = def.name or def.id,
+				desc = def.desc or "",
+				on = def.on,
+				off = def.off,
+				enabled = false,
+			}
+			feat.items[def.id] = item
+			feat.order[#feat.order + 1] = def.id
+			if def.default ~= false then feat.set(def.id, true, true) end
+			return item
+		end
+		
+		--- 开关一个功能：只调它自己的 on/off，不碰别的
+		function feat.set(id, v, silent)
+			local it = feat.items[id]
+			if not it then return false end
+			v = v and true or false
+			if it.enabled == v then return false end
+			it.enabled = v
+			local fn = v and it.on or it.off
+			if type(fn) == "function" then
+				local ok, err = pcall(fn, v)
+				if not ok then
+					Kit.lastError = tostring(err)
+					Kit.log("功能出错[" .. id .. "]:", tostring(err))
+				end
+			end
+			if not silent then Kit.log("功能", id, v and "开" or "关") end
+			return true
+		end
+		
+		--- 移除一个功能（先关掉再摘掉）
+		function feat.remove(id)
+			local it = feat.items[id]
+			if not it then return false end
+			feat.set(id, false, true)
+			feat.items[id] = nil
+			for i = #feat.order, 1, -1 do
+				if feat.order[i] == id then table.remove(feat.order, i) end
+			end
+			return true
+		end
+		
+		function feat.list()
+			local out = {}
+			for _, id in ipairs(feat.order) do
+				local it = feat.items[id]
+				if it then
+					out[#out + 1] = { id = it.id, name = it.name, desc = it.desc, enabled = it.enabled }
+				end
+			end
+			return out
+		end
+		
+		--- 把已注册功能铺到 WindUI 的 section 上（每个功能一个 Toggle）
+		function feat.bindTo(section)
+			if not section or type(section.Toggle) ~= "function" then return 0 end
+			local made = 0
+			for _, id in ipairs(feat.order) do
+				local it = feat.items[id]
+				if it then
+					local ok = pcall(function()
+						section:Toggle({
+							Title = it.name,
+							Desc = it.desc,
+							Value = it.enabled,
+							Callback = function(v) feat.set(id, v) end,
+						})
+					end)
+					if ok then made = made + 1 end
+				end
+			end
+			return made
+		end
+		
+		--- 把已注册功能铺到 Kit.ui 的 panel 上（回退用）
+		function feat.bindToKit(ui)
+			if not ui or type(ui.toggle) ~= "function" then return 0 end
+			local made = 0
+			for _, id in ipairs(feat.order) do
+				local it = feat.items[id]
+				if it then
+					local ok = pcall(function()
+						ui:toggle(it.name, it.enabled, function(v) feat.set(id, v) end)
+					end)
+					if ok then made = made + 1 end
+				end
+			end
+			return made
+		end
+		
+		------------------------------------------------------------------ 15.8 UI 库（Fluent）
+		-- 约定：脚本 UI 用 Fluent（dawid-scripts/Fluent），本地 vendor 优先。
+		-- 相比 WindUI：加载 10ms（WindUI 3770ms）、原生支持 MinimizeKey 快捷键、手机适配更好。
+		local FLUENT_LOCAL = { "vendor/Fluent.lua", "Fluent.lua" }
+		local FLUENT_URL = "https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"
+		
+		function Kit.fluent(opts)
+			opts = opts or {}
+			local cache = rawget(GENV_CACHE or {}, "__FLUENT_LIB")
+			if cache then return cache end
+		
+			local rf = g("readfile")
+			if type(rf) == "function" then
+				for _, path in ipairs(FLUENT_LOCAL) do
+					local ok, src = pcall(rf, path)
+					if ok and type(src) == "string" and #src > 1000 then
+						local chunk = loadstring(src, "@Fluent")
+						if chunk then
+							local ok2, lib = pcall(chunk)
+							if ok2 and type(lib) == "table" then
+								GENV_CACHE.__FLUENT_LIB = lib
+								return lib
+							end
+						end
+					end
+				end
+			end
+			if opts.offlineOnly then
+				Kit.log("Fluent：本地没有副本，且要求离线")
+				return nil
+			end
+			local ok, lib = pcall(function() return loadstring(game:HttpGet(FLUENT_URL))() end)
+			if ok and type(lib) == "table" then
+				GENV_CACHE.__FLUENT_LIB = lib
+				return lib
+			end
+			Kit.log("Fluent 加载失败：", tostring(lib))
+			return nil
+		end
+		
+		------------------------------------------------------------------ 16. 经验库（learn）
+		-- 让库自己记住：这次踩过什么、哪条路验证有效。下次开局先 recall，不重复踩。
+		local learn = { entries = {}, max = 300, auto = true }
+		Kit.learn = learn
+		
+		function learn.add(e)
+			if type(e) ~= "table" or not e.title then return nil end
+			-- 同标题合并：累加 hits，能看出「这个坑踩第几次了」
+			local prev = nil
+			for i = #learn.entries, 1, -1 do
+				if learn.entries[i].title == e.title then
+					prev = learn.entries[i]
+					table.remove(learn.entries, i)
+					break
+				end
+			end
+			local rec = {
+				id = e.id or ("L" .. (#learn.entries + 1)),
+				kind = e.kind or "pitfall",   -- pitfall / win
+				title = e.title,
+				how = e.how or "",
+				fix = e.fix or "",
+				tags = e.tags or {},
+				at = os.date and os.date("%m-%d") or "",
+				hits = (prev and prev.hits or 0) + 1,
+			}
+			table.insert(learn.entries, 1, rec) -- 新的在前
+			if #learn.entries > learn.max then table.remove(learn.entries) end
+			-- 每积累 5 条自动落盘一次：跨会话也能带着走（失败不报错，静默）
+			learn._dirty = (learn._dirty or 0) + 1
+			if learn._dirty >= 5 then
+				learn._dirty = 0
+				pcall(learn.save)
+			end
+			return rec
+		end
+		
+		function learn.find(q)
+			q = tostring(q or ""):lower()
+			local out = {}
+			for _, e in ipairs(learn.entries) do
+				local hay = (e.title .. " " .. e.how .. " " .. e.fix .. " " .. table.concat(e.tags, " ")):lower()
+				if q == "" or string.find(hay, q, 1, true) then out[#out + 1] = e end
+			end
+			return out
+		end
+		
+		function learn.report(q)
+			local list = learn.find(q)
+			Kit.log(string.format("经验库 %d 条（查询：%s）", #list, q or "全部"))
+			for _, e in ipairs(list) do
+				print(string.format("  [%s] %s\n       现象 %s\n       修法 %s", e.kind, e.title, e.how, e.fix))
+			end
+			return list
+		end
+		
+		--- 踩得最多的几条（自动捕获的排前面）
+		function learn.top(n)
+			local list = {}
+			for _, e in ipairs(learn.entries) do list[#list + 1] = e end
+			table.sort(list, function(a, b)
+				local ha, hb = a.hits or 0, b.hits or 0
+				if ha ~= hb then return ha > hb end
+				return (a.kind == "pitfall") and (b.kind ~= "pitfall")
+			end)
+			local out = {}
+			for i = 1, math.min(n or 5, #list) do out[i] = list[i] end
+			return out
+		end
+		
+		function learn.save(file)
+			return Kit.save(file or "dawg/learn.json", { entries = learn.entries })
+		end
+		
+		function learn.load(file)
+			local data = Kit.load(file or "dawg/learn.json", nil)
+			if type(data) == "table" and type(data.entries) == "table" and #data.entries > 0 then
+				learn.entries = data.entries   -- 直接接管，不做 add（否则 hits 会被重算）
+			end
+			return learn.entries
+		end
+		
+		------------------------------------------------------------------ 16.5 经验自动收集
+		-- 自动把「运行期异常」沉淀成 pitfall，不用人手动记。
+		-- 抓三类：
+		--   ① LogService 报错（脚本自身报错、游戏脚本报错）
+		--   ② 写入无效（setproperty 后读回值不一致 —— 这是最典型的坑）
+		--   ③ 远程调用异常（InvokeServer 抛错/超时）
+		local autoLearn = {
+			enabled = true,
+			conns = {},
+			seen = {},          -- 去重（同一条错误只记一次）
+			maxPerSession = 40, -- 单次会话最多记 40 条，防止刷爆
+			count = 0,
+			minInterval = 1.5,  -- 两次记录之间的最小间隔
+			lastAt = 0,
+		}
+		learn.auto = autoLearn
+		
+		local function autoAllowed(title)
+			if not autoLearn.enabled then return false end
+			if autoLearn.count >= autoLearn.maxPerSession then return false end
+			local now = os.clock()
+			if now - autoLearn.lastAt < autoLearn.minInterval then return false end
+			if autoLearn.seen[title] then return false end
+			autoLearn.seen[title] = true
+			autoLearn.lastAt = now
+			autoLearn.count = autoLearn.count + 1
+			return true
+		end
+		
+		--- 手动上报一条自动经验（外部模块也可以调）
+		function autoLearn.report(title, how, fix, kind)
+			if not autoAllowed(title) then return false end
+			learn.add({
+				kind = kind or "pitfall",
+				title = title,
+				how = how or "",
+				fix = fix or "",
+				when = "自动捕获 · " .. os.date("%m-%d %H:%M"),
+				auto = true,
+			})
+			return true
+		end
+		
+		--- 抓 LogService 报错
+		function autoLearn.hookErrors()
+			local LogService = game:GetService("LogService")
+			local conn = LogService.MessageOut:Connect(function(message, msgType)
+				if msgType ~= Enum.MessageType.MessageError then return end
+				local msg = tostring(message)
+				-- 过滤无关噪音
+				if msg:find("GetServerChannelRemote") or msg:find("Failed to load") then return end
+				-- 抓脚本错误：文件名:行号 + 错误内容
+				local loc, err = msg:match("([%w_%-%.]+:%d+:%s*.-)\n") , nil
+				local firstLine = msg:match("^[^\n]+") or msg
+				local title = "运行报错: " .. firstLine:sub(1, 60)
+				autoLearn.report(title, firstLine, "看堆栈定位；重复出现说明是结构性问题，别再重试同一路径")
+			end)
+			autoLearn.conns[#autoLearn.conns + 1] = conn
+			return conn
+		end
+		
+		--- 安全写属性：写后读回校验，不一致就自动记一条坑
+		function autoLearn.setVerified(obj, prop, value, label)
+			if not obj then return false end
+			local okSet = pcall(function() obj[prop] = value end)
+			if not okSet then
+				autoLearn.report(
+					string.format("写入失败: %s.%s", label or tostring(obj), prop),
+					"setproperty 抛错（属性只读/对象无效）",
+					"换通道：找对应 remote 或改父级对象"
+				)
+				return false
+			end
+			local okGet, got = pcall(function() return obj[prop] end)
+			if not okGet then return false end
+			local same = (typeof(got) == typeof(value)) and (tostring(got) == tostring(value))
+			if not same then
+				autoLearn.report(
+					string.format("写入被覆盖: %s.%s", label or tostring(obj), prop),
+					string.format("写入 %s 后读回 %s（被服务端/其他脚本重置）", tostring(value), tostring(got)),
+					"这类属性由服务端权威，别硬写；改走 remote 或放弃该路径"
+				)
+				return false
+			end
+			return true
+		end
+		
+		--- 包一层远程调用，失败自动记坑
+		function autoLearn.callRemote(remote, ...)
+			if not remote then return false, "no remote" end
+			local args = { ... }
+			local ok, res = pcall(function()
+				if remote:IsA("RemoteFunction") then
+					return remote:InvokeServer(table.unpack(args))
+				elseif remote:IsA("RemoteEvent") then
+					remote:FireServer(table.unpack(args))
+					return true
+				end
+				return false
+			end)
+			if not ok then
+				autoLearn.report(
+					string.format("远程失败: %s", tostring(remote.Name)),
+					"调用抛错: " .. tostring(res):sub(1, 80),
+					"检查参数类型/数量，或该 remote 需要前置条件（权限、物品、状态）"
+				)
+				return false, res
+			end
+			return true, res
+		end
+		
+		function autoLearn.stop()
+			for _, c in ipairs(autoLearn.conns) do pcall(function() c:Disconnect() end) end
+			autoLearn.conns = {}
+			autoLearn.enabled = false
+		end
+		
+		function autoLearn.stats()
+			return string.format("自动收集 %d 条（上限 %d），经验库共 %d 条",
+				autoLearn.count, autoLearn.maxPerSession, #learn.entries)
+		end
+		
+		------------------------------------------------------------------ 16.6 全自动：查经验 + 包操作
+		-- 目标：不用人记也不用人事先问，脚本自己在每次操作前后做检查。
+		
+		--- 按关键词查经验，返回可直接打印的建议文本（没命中返回 nil）
+		function autoLearn.advise(topic, limit)
+			if not topic or topic == "" then return nil end
+			local hits = learn.find(topic)
+			if #hits == 0 then return nil end
+			local lines = {}
+			for i = 1, math.min(limit or 3, #hits) do
+				local e = hits[i]
+				lines[#lines + 1] = string.format("[%s] %s → %s", e.kind, e.title, e.fix or "")
+			end
+			return table.concat(lines, "\n")
+		end
+		
+		--- 操作前自动提示（打印到控制台，不用人问）
+		function autoLearn.before(topic)
+			local tip = autoLearn.advise(topic, 2)
+			if tip then
+				Kit.log("经验提醒（" .. topic .. "）：\n" .. tip)
+			end
+			return tip
+		end
+		
+		--- 通用操作包装：自动验结果 + 失败自动记坑
+		-- 用法：L.run("改门碰撞", function() ... return 结果 end,
+		--            { verify = function(r) return r ~= nil end,
+		--              fix = "如果这里失败，说明..." })
+		function autoLearn.run(name, fn, opt)
+			opt = opt or {}
+			local t0 = os.clock()
+			local ok, res = pcall(fn)
+			local ms = math.floor((os.clock() - t0) * 1000)
+		
+			if not ok then
+				autoLearn.report(
+					"操作异常: " .. name,
+					"抛错: " .. tostring(res):sub(1, 100),
+					opt.fix or "看堆栈；连续两次同样错误就别再试这条路"
+				)
+				return false, res
+			end
+		
+			if opt.verify then
+				local vOk, passed = pcall(opt.verify, res)
+				if not vOk or not passed then
+					autoLearn.report(
+						"结果无效: " .. name,
+						string.format("返回 %s 但校验没通过（%dms）", tostring(res):sub(1, 60), ms),
+						opt.fix or "结果被服务端覆盖/条件不满足，换通道或放弃该路径"
+					)
+					return false, res
+				end
+			end
+		
+			return true, res
+		end
+		
+		--- 启动时自动注入常用经验到控制台（boot 会调）
+		function autoLearn.bootBrief()
+			local top = learn.top(3)
+			if #top == 0 then return end
+			local lines = { "高频坑（自动加载）：" }
+			for _, e in ipairs(top) do
+				lines[#lines + 1] = string.format("  · %s —— %s", e.title, (e.fix or ""):sub(1, 60))
+			end
+			Kit.log(table.concat(lines, "\n"))
+		end
+		
+		-- 启动经验自动收集（抓报错 / 写入被覆盖 / 远程失败）
+		task.spawn(function()
+			pcall(function()
+				learn.load()          -- 读回历史经验
+				autoLearn.hookErrors()-- 开始监听报错
+				Kit.log("经验自动收集已启动 · " .. autoLearn.stats())
+				autoLearn.bootBrief()
+			end)
+		end)
+		
+		-- 预置：本次实战（Ugc 狩猎 / Potassium v2.6）的坑与有效方案
+		local SEED = {
+			-- 思路层
+			{ kind = "sop", id = "S1", title = "总纲：四条判断顺序", how = "① 谁说了算 ② 写回读验 ③ 换通道（相机→输入→发包）④ 两条不通就收手喂满", fix = "任何新游戏都从这四步开始", tags = { "thinking" } },
+			{ kind = "sop", id = "S2", title = "先问：这个数值/行为谁说了算", how = "客户端权威随手改；服务端权威只能找它允许的口子", fix = "先分客户端/服务端，再选手段", tags = { "thinking" } },
+			{ kind = "sop", id = "S00", title = "加功能前先去 xahub 翻现成的", how = "D:/AI.dawangou/xahub 下有 XA 脚本的源码/脱壳/成品多份副本，夜视(Fullbright)、去雾(NoFog)、画质、锁定视角这些都有", fix = "先 grep xahub 找实现与参数，没有再自己写；自己写容易像夜视那样反复调光照还不像", tags = { "thinking", "reuse" } },
+			{ kind = "sop", id = "S0", title = "动手前先扫反作弊，按它的检测面设计", how = "Kit.ac.scan() 看客户端有什么守卫/踢人/Voltils 类；它盯什么决定了你不能走哪条路", fix = "顺序永远是「先看检测面 → 再设计手段 → 最后写功能」；反过来要重写", tags = { "thinking", "anticheat" } },
+			{ kind = "sop", id = "S3", title = "改之前先测：写一次、等一秒、读回", how = "属性被覆写、相机被覆盖、输入被忽略，只有读回能发现", fix = "保持=可能可用；复原=这条路不通", tags = { "thinking", "measure" } },
+			{ kind = "sop", id = "S4", title = "输入层被忽略就去发包", how = "mousemoverel 后 GetMouseDelta 恒 0 = 输入进不了游戏", fix = "改找方向/发射 remote", tags = { "thinking", "aim" } },
+			{ kind = "sop", id = "S5", title = "先出效果，再碰机制", how = "ESP 这类纯客户端功能能立刻验证探针/渲染/循环链路", fix = "机制类（瞄准/伤害）最后做", tags = { "thinking" } },
+			{ kind = "sop", id = "S6", title = "一次只改一个变量 + 量化阈值", how = "抖动<0.1°/帧、接受率连续两轮+30%、锁定偏差<5°", fix = "多变量同时改无法归因", tags = { "thinking", "measure" } },
+			{ kind = "sop", id = "S7", title = "两条路无提升就收手", how = "到了服务端硬上限，再调也是喂满；出现「只能重进」的副作用立刻回滚", fix = "接受上限→压门喂满", tags = { "thinking" } },
+		
+			-- 环境 / hook 层
+			{ kind = "pitfall", id = "K86", title = "执行器 getgenv() ≠ _G", how = "readfile/hookfunction 只挂 genv，rawget(_G,'readfile') 是 nil；_G.__X 与 genv().__X 互不可见", fix = "能力取 genv[name] or rawget(_G,name)；句柄一律写 getgenv()", tags = { "env", "executor" } },
+			{ kind = "pitfall", id = "K87", title = "hookmetamethod 改实例 __newindex 会吞掉所有属性写入", how = "拿不到原方法时返回 nil，之后 part.Name 写不进、ScreenGui 挂不上、相机冻结；元表全局共享且撤不回", fix = "改相机用 PreRender 写 CFrame；要 hook 就 hook 函数，别碰元表", tags = { "hook", "fatal" } },
+			{ kind = "pitfall", id = "K90", title = "相机 Scriptable 时写 CFrame 被每帧覆盖", how = "写入后 0.5 秒偏差回 0°，游戏自己每帧写；mousemoverel 也无效", fix = "RunService.PreRender 写（渲染前最后一刻），实测偏差 146°→4.5°", tags = { "camera" } },
+			{ kind = "pitfall", id = "K88", title = "准星不由相机决定，且高频刷方向会被锁伤害", how = "准星跟 UpdateHeadDirection（10Hz Vector3）；60Hz 抢发判异常，枪没伤害只能重进", fix = "只在扣扳机+有目标时 10Hz 同步方向；平时不发", tags = { "aim", "remote", "anticheat" } },
+			{ kind = "pitfall", id = "K89", title = "「我打过」≠「已经死了」", how = "尸体标记只校验归属，打中没死的动物也会变尸体绿并继续跑", fix = "引用分支也要过 RagdollSettled / AnimalRagdoll / DeadAnimals", tags = { "esp", "logic" } },
+		
+			-- 测量纪律
+			{ kind = "pitfall", id = "K91", title = "窗口失焦时所有测量都不可信", how = "角色位移 0、mouse1click 无响应、traffic 0 条、相机不动，但帧率照跑", fix = "先确认能动能开枪，再判断方案有效无效", tags = { "measure" } },
+			{ kind = "pitfall", id = "K105", title = "异常数据先排除「人在操作」再猜原因", how = "数值突跳、位置对不上、采样前后不一致，可能是操作者刚好在移动/开枪/切武器/开镜/转视角", fix = "先问「刚才有没有操作」，确认不是人为再分析机制；否则把人动作当游戏行为，结论全错", tags = { "measure", "human" } },
+			{ kind = "pitfall", id = "K92", title = "没伤害先看弹药", how = "CurrentAmmoLabel=0 时怎么打都没伤害，容易被误判成脚本搞坏游戏", fix = "先读弹药/武器 UI，再怀疑代码", tags = { "debug" } },
+		
+			-- 数据 / ESP
+			{ kind = "pitfall", id = "K93", title = "DeadAnimals 没有「谁打的」字段", how = "尸体只有 Id/Weight/Sex/AIState/RagdollSettled", fix = "开火时记 Id + 模型引用；收集走 AnimalRagdoll 标签 + DeadAnimals + 引用三源", tags = { "esp", "data" } },
+			{ kind = "pitfall", id = "K94", title = "Highlight 透明度 0.92 等于看不见", how = "想做「只描边」，结果远看什么都没有，以为高亮失效", fix = "可见至少 0.55–0.7；纯描边用 1.0 + 对比色", tags = { "ui", "esp" } },
+			{ kind = "pitfall", id = "K95", title = "重载脚本会清掉运行时状态", how = "local 表每次 loadstring 归零，之前打过的尸体不再标绿", fix = "跨重载状态挂 getgenv()；经验库落盘", tags = { "state" } },
+			{ kind = "pitfall", id = "K96", title = "同实例从活体变尸体不会自动换样式", how = "attach 只在首建时设颜色，死后仍显示原配色和名字", fix = "take() 比对 tag/style，不同就原地改颜色与文字", tags = { "ui", "esp" } },
+		
+			-- 吸附（本轮新增）
+			{ kind = "pitfall", id = "K97", title = "吸附中心点按玩家身高算会偏高", how = "height=1.2 是玩家躯干高度，动物不到那么高，准心飘在背上", fix = "动物用 0.5–0.6；按目标类型分别设", tags = { "aim" } },
+			{ kind = "pitfall", id = "K98", title = "横着划视角会越来越歪", how = "每帧用当前 UpVector 重建相机，roll 会累积", fix = "用世界 up = Vector3.new(0,1,0)，roll 恒为 0", tags = { "aim", "camera" } },
+			{ kind = "pitfall", id = "K99", title = "死区边界会让准星抽搐", how = "目标在死区线上来回跨，权重在「不动」和「强吸」间跳变", fix = "改成连续权重（按屏幕偏离比例），不要二值边界", tags = { "aim" } },
+			{ kind = "pitfall", id = "K100", title = "手机：手指按在屏幕上导致吸力被砍", how = "用「0.4 秒内有滑动」判断操作中，手机开镜时手指一直按着 → 吸力乘 0.45，永远跟不上", fix = "手机不要按手指活跃度削减吸力", tags = { "aim", "mobile" } },
+			{ kind = "pitfall", id = "K101", title = "手机：准星圈按固定像素会失效", how = "PC 110px 占屏高 12%，手机 2000+ 高只占 5%，几乎摸不到", fix = "半径 = 视口高 × 比例（手机 0.16），判定与绘制同源", tags = { "aim", "mobile" } },
+			{ kind = "pitfall", id = "K102", title = "追移动目标：只调吸力没用，要预判", how = "瞄的是上一帧位置，动物跑起来永远差半个身位", fix = "目标点 + 速度×0.08~0.14 秒提前量；同时上限速放宽（9°→22°/帧）", tags = { "aim" } },
+		
+			-- 工程
+			{ kind = "pitfall", id = "K103", title = "Python 切片方向反了会写坏整个文件", how = "s[a:b] 中 b<a 得空串，replace('', new) 在每个字符间插入", fix = "替换前 assert a<b 且 old 命中数 ==1", tags = { "tooling", "fatal" } },
+			{ kind = "pitfall", id = "K104", title = "局部函数/变量前向引用是 nil", how = "updateRing、lastTouchMove 在定义之前被回调引用，永远 nil，效果静默失效", fix = "先 local 声明再加 nil 保护，或把定义提前", tags = { "lua" } },
+		
+			-- 有效方案
+			{ kind = "pitfall", id = "K108", title = "WindUI 的 Destroy 有 bug，窗口坏了只能重进", how = "Window:Destroy() 抛 attempt to index nil；销毁失败后窗口进入半损坏状态，之后所有 w:Tab 报 Frame is not a valid member of ScrollingFrame", fix = "别调 Destroy；重载脚本时复用 WindUI.Window；控件创建整段包 pcall，失败回退 Kit.ui", tags = { "ui", "windui" } },
+			{ kind = "pitfall", id = "K112", title = "「我打过」要分两段：开火只登记候选，尸体真出现才转正", how = "直接在开火瞬间把准星附近动物记成击杀 → 打空的也标成尸体；反过来只在锁定目标时记 → 手动瞄准打死的反而记不上（一枪死的更快，来不及补）", fix = "开火时只写 pending（Id+时间戳，8 秒有效期），等尸体列表里出现同 Id 再转正成击杀；超时丢弃。注意 InputBegan 的 gp 常为 true，别用它提前 return", tags = { "esp", "logic" } },
+			{ kind = "pitfall", id = "K111", title = "UI 面板盖住准星会让游戏「打不出伤害、测距归零」", how = "Fluent 默认把窗口放在屏幕中央偏右，正好压住准星；点击被面板的拖动区吃掉，游戏收不到射击/测距输入。另外 Acrylic=true 会生成全屏模糊层，同样干扰。表现为打死活没伤害、测距恒 0，点 X 关掉面板立刻恢复", fix = "面板固定挪到右上角（w.Root.Position = UDim2.new(1,-620,0,20)），且 Acrylic 设 false。排查任何「功能突然失效」先看有没有 UI 盖着准星", tags = { "ui", "fatal" } },
+			{ kind = "pitfall", id = "K110", title = "Fluent 的 Slider 会把小数默认值截成 0", how = "Default=0.85 / 0.5 都变 0，整数（1、120、2000）正常；用 Default=0.85 的吸附强度直接失效", fix = "小数参数改成整数百分比映射：Min=30 Max=100，回调里 /100 还原", tags = { "ui", "fluent" } },
+			{ kind = "pitfall", id = "K109", title = "Fluent 单窗口且 Destroy 后内部状态锁死", how = "Window:Destroy() 本身能跑，但内部「已创建」标记不清，之后 CreateWindow 报 You cannot create more than one window；本会话就再也建不出面板", fix = "重载时复用窗口：清空 TabHolder / ContainerHolder 再 AddTab；永远不要调 Window:Destroy", tags = { "ui", "fluent" } },
+			{ kind = "pitfall", id = "K107", title = "WindUI 的 CreateWindow 在本执行器会挂起", how = "库能加载（API 齐全），但 CreateWindow 调用不返回，连续两次 40s 超时；游戏本身没死，是那个调用把线程挂住，之后同会话的 exec 也不稳", fix = "面板默认用 Kit.ui；要试 WindUI 把 CFG.useWindUI 打开，且只在一个可丢弃的会话里试", tags = { "ui", "windui", "fatal" } },
+			{ kind = "win", id = "W1", title = "屏幕空间准星圈：圈内才锁、开镜不缩放", how = "WorldToViewportPoint 投影，算到屏幕中心像素距离", fix = "score = 1 - dist/radius，距离不参与，避免总锁最近的", tags = { "aim", "ui" } },
+			{ kind = "win", id = "W2", title = "自适应目标源 + 多地图汉化", how = "常见文件夹名优先，名字关键词兜底，只扫直接子级；物种表按北美/非洲分组约 90 条", fix = "换服/换图不改代码", tags = { "esp", "portable" } },
+			{ kind = "win", id = "W3", title = "距离牌文本永远刷新，只用距离控显隐", how = "超远时只 Enabled=false，不停止写文本", fix = "避免「牌子看起来没刷新」的误判", tags = { "esp", "ui" } },
+			{ kind = "win", id = "W4", title = "agent RPC：一条命令一件事、回一行 JSON、大结果落盘", how = "@@DAWG@@ 前缀便于 grep；超 40 条或 16KB 落 dawg/*.json", fix = "recon/remotes/scripts/gui/eval/hookfn/dump/read", tags = { "agent" } },
+			{ kind = "win", id = "W5", title = "lab 实验台：先测后判", how = "trial/sweep/plan/channels/clockProbe/pushQueue 量化接受率", fix = "达标才认，不达标换下一条", tags = { "lab" } },
+			{ kind = "win", id = "W6", title = "经验库自动捕获 + 落盘", how = "Kit.safe/hook 失败自动入库；同标题累加 hits（错误去行号归一化）；每 5 条存 dawg/learn.json", fix = "boot 时读回并打印踩得最多的三条", tags = { "learn" } },
+		}
+		
+		-- 种子只在库为空时灌入，避免 load 之后又 seed 一遍（hits 会翻倍）
+		if #learn.entries == 0 then
+			for _, e in ipairs(SEED) do learn.add(e) end
+		end
+		
+		------------------------------------------------------------------ 17. 卸载
+		-- K59：热注入必须清干净；hook 保留（K26），只停循环、断连接、销毁 GUI
+		function Kit.cleanup(opts)
+			opts = opts or {}
+			for i = #CONNS, 1, -1 do
+				pcall(function() CONNS[i]:Disconnect() end)
+				CONNS[i] = nil
+			end
+			local gm = GENV.__dawg_ui
+			if gm and gm.destroy then pcall(gm.destroy, gm) end
+			GENV.__dawg_ui = nil
+			if opts.movers ~= false then Kit.clearMovers() end
+			for _, g in ipairs(safe(function() return game:GetService("CoreGui"):GetChildren() end) or {}) do
+				if g.Name == "DawgKit_UI" then pcall(function() g:Destroy() end) end
+			end
+			local pg = Players.LocalPlayer and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+			if pg then
+				for _, g in ipairs(pg:GetChildren()) do
+					if g.Name == "DawgKit_UI" then pcall(function() g:Destroy() end) end
+				end
+			end
+			Kit.log("已清理（hook 保留，重进游戏才真正复位）")
+		end
+		
+		------------------------------------------------------------------ 18. 单例装载
+		-- K25 / K59 / K60：同一会话重复注入 → 先清旧实例
+		do
+			local prev = GENV.__DAWG_KIT
+			if type(prev) == "table" and prev.cleanup then
+				pcall(prev.cleanup)
+			end
+			GENV.__DAWG_KIT = Kit
+			_G.__DAWG_KIT = Kit
+		end
+		
+		Kit.log(string.format("v%s 已就绪 | executor=%s studio=%s hook=%s conn=%s file=%s",
+			Kit.version, tostring(Kit.env.isExecutor), tostring(Kit.env.isStudio),
+			tostring(Kit.env.hasHook), tostring(Kit.env.hasConn), tostring(Kit.env.hasFile)))
+		
+		return Kit
+	end
+	pcall(__bootKit)
 	Kit = GENV.__DAWG_KIT
 	if not Kit then
-		error("[忍者版] 找不到 DawgKit：请先把 DawgKit.lua 放进执行器工作目录（boot ok=" .. tostring(okBoot) .. "）")
+		error("[忍者版] 内嵌 DawgKit 启动失败")
 	end
 end
 -- 忍者没有 gethui 时统一退回 CoreGui
