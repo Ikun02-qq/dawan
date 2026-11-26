@@ -3298,14 +3298,22 @@ local function onProjectileHit(res)
 	local node = res.Instance
 	local depth = 0
 	while node and depth < 6 do
-		if targets[node] then
+		-- 【不能只认 targets】一枪秒杀时动物在子弹命中的同一帧就被移出 Animals，
+		-- 而 targets 是 sync() 每 0.5 秒重建的活体表 —— 这一刻里面已经没有它了。
+		-- 老写法 targets[node] 判 false 就 continue，爬到顶也找不到，记一次 __PROJ_MISS 走人，
+		-- 尸体随后出现却因为 shotHitIds 里没这个 Id 而不被认领 → 「秒死尸体不显示」。
+		-- 改成只看 Id 属性：Id 是本作动物的唯一标识（形如 1795262786967-xxx-0），
+		-- 骨骼、武器、玩家角色都没有这个属性。
+		-- 万一别的东西也有 Id 也不会误标：后续 sweepNearbyCarcasses 只处理
+		-- AnimalRagdoll 标签和 DeadAnimals 子级，玩家/model 根本不进这两个集合。
+		if node:IsA("Model") then
 			local ok, id = pcall(function() return node:GetAttribute("Id") end)
 			if ok and id ~= nil then
 				shotHitIds[tostring(id)] = os.clock()
-				GENV.__MB = { t = os.clock(), stage = "proj", found = node.Name }
+				GENV.__MB = { t = os.clock(), stage = "proj", found = node.Name, viaId = true }
 				GENV.__PROJ_HITS = (GENV.__PROJ_HITS or 0) + 1
+				return
 			end
-			return
 		end
 		node = node.Parent
 		depth = depth + 1
