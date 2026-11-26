@@ -2231,6 +2231,30 @@ end
 
 -- 候选击杀：开火时只登记 Id，等尸体真的出现（8 秒内）才转正成击杀。
 -- 直接记「开火时准星附近的动物」会把打空的也标成尸体（K89）。
+-- 候选有效期（秒）：开火后这么久之内目标真的变成尸体，才算我打中的。
+-- 原来是 300 秒 —— 太长了，别人打死的也会算进来
+-- （用户反馈「连线的目标被其他玩家的子弹打中了会标蓝」）。
+-- 最近一次真实发射（btFireHook 里写入）。
+-- 必须在 markPending 之前声明：Lua 的 local 只对后面定义的函数可见，
+-- 定义在 markPending 之后的话函数里读到的是全局 nil，开枪检测永远失效。
+local lastShot = nil
+-- 发射后多少秒之内算「这一枪是我打的」。
+-- 3446 studs/s 的弹速飞 2000 格要 0.58 秒，留一倍余量。
+local SHOT_WINDOW = 1.0
+
+-- 额外尸体兜底用的「我射线撞到过」集合：按 Id 字符串永久记。
+-- 和 pendingKills 的区别就在这里 —— pendingKills 挂的是模型引用，
+-- 模型被销毁 / 换实例就没了；这里按 Id 记，尸体换个实例也认得回来。
+local shotHitIds = getgenv().__DAWG_SHOT_HIT_IDS
+if type(shotHitIds) ~= "table" then
+	shotHitIds = {}
+	getgenv().__DAWG_SHOT_HIT_IDS = shotHitIds
+end
+-- 只用来决定「打中」标签显示多久，不再用来决定归属：
+-- 动物中枪后可能跑十几秒才倒，倒下还要播死亡动画，
+-- 用「多少秒内」判归属一定会漏真打死的（这个 bug 已经修过两次了）。
+local PENDING_TTL = 15
+local PENDING_VISIBLE = 15
 local pendingKills = getgenv().__DAWG_PENDING_KILLS
 if type(pendingKills) ~= "table" then
 	pendingKills = {}
@@ -2239,9 +2263,16 @@ end
 
 local function markPending(model)
 	if not model then return end
+	-- 开枪检测：最近 SHOT_WINDOW 秒内没有真实发射，说明这一枪不是我打的，直接丢掉。
+	-- 用户反馈「FOV 内别人打的还是会算给我」—— 之前 markPending 只看「目标在不在准星附近」，
+	-- 我根本没开枪，邻居把目标打死也会被记成我的候选。
+	if not lastShot or (os.clock() - lastShot.t) > SHOT_WINDOW then return end
 	local ok, id = pcall(function() return model:GetAttribute("Id") end)
 	if ok and id ~= nil then
-		pendingKills[tostring(id)] = os.clock()
+		-- 候选不设过期时间：记下模型引用，等它真的变成尸体再转正。
+		-- 之前存 os.clock() 时间戳 + 8 秒 TTL，动物拖过 8 秒才倒，
+		-- 尸体就永远认不回来（用户反馈「标记时间过后死的动物不显示尸体高亮」）。
+		pendingKills[tostring(id)] = { t = os.clock(), model = model }
 	end
 end
 
@@ -2259,6 +2290,8 @@ end
 local fireConn
 -- 射线判定：从相机中心往前打一条线，只有真正被这条线打中的动物才算「打中」。
 -- 之前用「准星 160px 内全部记一笔」，周围没打中的也被记 → 它们后来死了就被误标成我的尸体。
+-- raycastAnimal 用上面那个 lastShot 替代相机方向判命中（只影响判得准不准，不新增记账点）。
+
 local function raycastAnimal()
 	local cam = workspace.CurrentCamera
 	if not cam then return nil end
@@ -2273,8 +2306,15 @@ local function raycastAnimal()
 	-- raycastAnimal 立刻返回 nil，markPending 永远不执行 → 尸体不被认成自己的。
 	if cam then ign[#ign + 1] = cam end
 	params.FilterDescendantsInstances = ign
+	-- 判定源：0.5 秒内有过真实发射，就用那条弹道；否则退回相机中心。
+	-- 实测诊断：子追开枪时相机中心压在 Terrain 上（rayPart=Terrain dist=50/107，
+	-- 或 Barrier / noHit），而子弹是飞向动物的 —— 用相机判会把真打中的判丢。
+	-- 反过来没开枪时用相机判，又会把只是「站在视线里」的动物误标。
+	local usingShot = lastShot ~= nil and (os.clock() - lastShot.t) < 0.5
+	local rayOrigin = usingShot and lastShot.origin or cam.CFrame.Position
+	local rayDir = usingShot and lastShot.dir.Unit or cam.CFrame.LookVector
 	local ok, result = pcall(function()
-		return workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 2000, params)
+		return workspace:Raycast(rayOrigin, rayDir * 2000, params)
 	end)
 	if not ok or not result or not result.Instance then return nil end
 	local node = result.Instance
@@ -2286,76 +2326,23 @@ local function raycastAnimal()
 		depth = depth + 1
 	end
 	if not found then return nil end
-	-- 第二道校验：命中的模型必须在准星 120 像素内。
+	-- 第二道校验（只在相机射线时用）：命中的模型必须在准星 120 像素内。
 	-- 装饰墙可能 CanQuery=false，射线会穿过去打到墙后的动物；靠屏幕距离把这种剔掉。
-	local vp = cam.ViewportSize
-	local sp, onScreen = cam:WorldToViewportPoint(found.PrimaryPart and found.PrimaryPart.Position or found:GetPivot().Position)
-	if not onScreen then return nil end
-	local dx, dy = sp.X - vp.X / 2, sp.Y - vp.Y / 2
-	if math.sqrt(dx * dx + dy * dy) > 120 then return nil end
+	-- 用真实弹道时不加这道 —— 子弹本来就飞那儿，准星偏不偏跟打没打中无关。
+	if not usingShot then
+		local vp = cam.ViewportSize
+		local sp, onScreen = cam:WorldToViewportPoint(found.PrimaryPart and found.PrimaryPart.Position or found:GetPivot().Position)
+		if not onScreen then return nil end
+		local dx, dy = sp.X - vp.X / 2, sp.Y - vp.Y / 2
+		if math.sqrt(dx * dx + dy * dy) > 120 then return nil end
+	end
 	return found
 end
 
-fireConn = UIS.InputBegan:Connect(function(input, gp)
-	-- 不检查 gp：游戏自己的 UI 会消费点击，gp 常常是 true
-	if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-	local hit = raycastAnimal()
-	if hit then markPending(hit) end
-
-	-- 诊断：记录每次开火时 raycastAnimal 的结果与失败原因（最多 20 条）
-	local diag = GENV.__DAWG_FIRE_DIAG
-	if type(diag) ~= "table" then diag = {} GENV.__DAWG_FIRE_DIAG = diag end
-	local rec = { t = os.clock(), ok = hit ~= nil }
-	if hit then
-		rec.name = hit.Name
-	else
-		local cam2 = workspace.CurrentCamera
-		if cam2 then
-			local p2 = RaycastParams.new()
-			p2.FilterType = Enum.RaycastFilterType.Exclude
-			local ig = {}
-			local c2 = Players.LocalPlayer.Character
-			if c2 then ig[#ig + 1] = c2 end
-			if folder then ig[#ig + 1] = folder end
-			if cam2 then ig[#ig + 1] = cam2 end
-			p2.FilterDescendantsInstances = ig
-			local ok2, r2 = pcall(function()
-				return workspace:Raycast(cam2.CFrame.Position, cam2.CFrame.LookVector * 2000, p2)
-			end)
-			if ok2 and r2 and r2.Instance then
-				rec.rayPart = r2.Instance.Name
-				rec.rayDist = math.floor(r2.Distance)
-				local node, dp = r2.Instance, 0
-				while node and dp < 6 do
-					if node:IsA("Model") then
-						local ok3, id = pcall(function() return node:GetAttribute("Id") end)
-						if ok3 and id ~= nil then
-							rec.foundModel = node.Name
-							rec.inTargets = targets[node] ~= nil
-							local vp = cam2.ViewportSize
-							local pos = node.PrimaryPart and node.PrimaryPart.Position or node:GetPivot().Position
-							local sp, onScr = cam2:WorldToViewportPoint(pos)
-							if onScr then
-								local ddx, ddy = sp.X - vp.X / 2, sp.Y - vp.Y / 2
-								rec.offsetPx = math.floor(math.sqrt(ddx * ddx + ddy * ddy))
-							else
-								rec.offsetPx = -1
-							end
-							break
-						end
-					end
-					node = node.Parent
-					dp = dp + 1
-				end
-			else
-				rec.rayPart = "noHit"
-			end
-		end
-	end
-	diag[#diag + 1] = rec
-	if #diag > 20 then table.remove(diag, 1) end
-end)
-
+fireConn = nil
+-- 这里原本挂着 InputBegan 的诊断射线：每次点左键都跑一遍 2000 格 Raycast，
+-- 只为了往 GENV.__DAWG_FIRE_DIAG 里记流水，且引用的 `hit` 根本不存在（永远 nil）。
+-- 记账完全不需要它：真实记账只在 btFireHook，用子弹出膛那一刻的真实 origin/dir。
 -- 结算数据采集（只为推算公式用，不影响显示）
 -- 面板上直接写着每项加成分：Tiger (+108) / 76 kg (+69) / 2 years (+18) / Male (+5)
 local scoreSamples = GENV.__DAWG_SCORE_SAMPLES
@@ -2455,8 +2442,15 @@ local function collectMyCarcasses()
 		--      否则 pendingKills 一删，下一轮扫描就认不出这具尸体了。
 		local mine = (idStr ~= nil and myKills[idStr] == true) or myKillModels[m] == true
 		if not mine and idStr then
-			local ts = pendingKills[idStr]
-			if ts and (os.clock() - ts) < 300 then
+			local rec = pendingKills[idStr]
+			-- 兼容旧版存数字的残留
+			if type(rec) == "number" then
+				rec = { t = rec }
+				pendingKills[idStr] = rec
+			end
+			-- 不看时间，只看「候选记的就是这只」。
+			-- 动物中枪后拖多久才倒都能认回来，不会因为超时漏掉。
+			if rec and rec.model == m then
 				mine = true
 				myKills[idStr] = true
 				myKillModels[m] = true
@@ -2474,15 +2468,48 @@ local function collectMyCarcasses()
 	if dead then
 		for _, m in ipairs(dead:GetChildren()) do add(m) end
 	end
-	-- 清掉超过 5 分钟还没变成尸体的候选
-	for id, ts in pairs(pendingKills) do
-		if os.clock() - ts > 300 then pendingKills[id] = nil end
+	-- 只清「目标模型已经不存在」的候选：目标没死透就继续等，不按时间丢。
+	-- 这是「标记时间过后死的动物不显示尸体高亮」的根治：只要这只动物还在
+	-- workspace 里（活着或变成尸体），候选就一直有效。
+	for id, rec in pairs(pendingKills) do
+		local mdl = (type(rec) == "table") and rec.model or nil
+		if mdl == nil or not mdl.Parent then pendingKills[id] = nil end
 	end
 	-- myKillModels 不再参与判定，只做清理（历史残留的引用该放就放）
 	for m in pairs(myKillModels) do
 		if not m.Parent then myKillModels[m] = nil end
 	end
 	return list
+end
+
+-- 额外尸体检查：每 CARCASS_SWEEP 秒独立扫一遍尸体，
+-- 凡是「我开枪后射线撞到过」的 Id 出现在尸体堆里，就认成我打死的。
+-- 这不是重复造一个 collectMyCarcasses，而是换了一个持久判据：
+-- collectMyCarcasses 看 pendingKills（模型引用），这里看 shotHitIds（Id 字符串）。
+-- 转正后只写 myKills / myKillModels，加高亮交给 sync 的 take()——
+-- take 里比较 tag/style，已经有高亮的不会重刷（用户要求「有高亮的不管」）。
+local CARCASS_SWEEP = 3.0
+local carcassAcc = 0
+
+local function sweepCarcasses()
+	local hit = 0
+	local function try(m)
+		if not m or not m:IsA("Model") or not m.Parent then return end
+		local ok, id = pcall(function() return m:GetAttribute("Id") end)
+		if not ok or id == nil then return end
+		local idStr = tostring(id)
+		if not shotHitIds[idStr] then return end
+		if myKills[idStr] and myKillModels[m] then return end
+		myKills[idStr] = true
+		myKillModels[m] = true
+		hit = hit + 1
+	end
+	for _, m in ipairs(CollectionService:GetTagged("AnimalRagdoll")) do try(m) end
+	local dead = workspace:FindFirstChild("DeadAnimals")
+	if dead then
+		for _, m in ipairs(dead:GetChildren()) do try(m) end
+	end
+	GENV.__SWEEP = { t = os.clock(), hit = hit, ids = (function() local n = 0 for _ in pairs(shotHitIds) do n = n + 1 end return n end)() }
 end
 
 -- 每只动物的唯一 key：优先 Id 属性（形如 1795353705360-1e7495f7-...-0，每只都不同），
@@ -2601,7 +2628,8 @@ local function sync()
 		for _, m in ipairs(carcasses) do carcassSet[m] = true end
 		-- 我打死的先画（绿色描边，优先占位）
 		for _, m in ipairs(carcasses) do
-			pcall(noteCarcass, m)
+			-- 已经是「我打中的尸体」样式就不再重复处理：
+			-- take 里靠比较 tag/style 实现跳过，这里先把常见情况短路掉。
 			-- 预估分由 attach 的 scoreLine（第一行）统一显示，这里不再重复
 			take(m, PALETTE.mine, localName(m) .. "尸体")   -- 例：灰熊尸体 / 花鹿尸体
 		end
@@ -2612,8 +2640,9 @@ local function sync()
 				local hit = false
 				local okId, id = pcall(function() return m:GetAttribute("Id") end)
 				if okId and id ~= nil then
-					local ts = pendingKills[tostring(id)]
-					if ts and (os.clock() - ts) < 300 then hit = true end
+					local rec = pendingKills[tostring(id)]
+					local t0 = (type(rec) == "table") and rec.t or rec
+					if t0 and (os.clock() - t0) < PENDING_VISIBLE then hit = true end
 				end
 				if hit then
 					take(m, PALETTE.hit, localName(m) .. "（打中）")
@@ -2670,6 +2699,10 @@ end
 -- 动物瞄准点：RootPart + 肺偏移（偏移烘成局部坐标，避免骨骼抖动 K23）
 local organCache = setmetatable({}, { __mode = "k" })
 local headCache = setmetatable({}, { __mode = "k" })   -- 瞄头时兜底头顶偏移的缓存
+-- 器官 Attachment 引用缓存（只缓存对象本身，不缓存坐标）。
+-- 之前 FindFirstChild(name, true) 每帧递归搜子孙，20+ 只动物 × 60Hz 太贵。
+local organRefs = setmetatable({}, { __mode = "k" })
+local organSmooth = setmetatable({}, { __mode = "k" })
 -- 物种级的瞄准点纵向微调（单位 studs，负值=往下）。
 -- 实测：大体型野猪 / 驼鹿的 RigChest 与两肺中点都落在体高约 63% 处，
 -- 而真实致命区偏低一点，打上去弹道会从背上擦过去。
@@ -2683,6 +2716,38 @@ local SPECIES_AIM_DY = {
 	feralhog = -0.40,
 	-- 驼鹿有肺，两肺中点本来就在体高 63%，只需微调
 	moose = -0.18,
+	-- 白尾鹿（WhiteTailedDeerMale / Female → 都归到 whitetaileddeer）：
+	-- 两肺中点落在体高偏上的位置，子追打上去子弹从背上擦过去，往下压 0.15 studs。
+	whitetaileddeer = -0.15,
+	-- 熊：GrizzlyBear 实测——两肺中点比心脏高约 0.35 studs，落在肩隆/脖子根的高度，
+	-- 视觉上就是用户说的「靠脖子」。往下压 0.25 落到胸腔中部（±0.05 内）。
+	-- 注意物种 key 是 grizzlybear，不是 grizzly —— speciesKey 只做小写和剥后缀，
+	-- 不会把 GrizzlyBear 拆成 grizzly，之前写 grizzly 所以一直没匹配上。
+	grizzlybear = 0,
+	grizzly = 0,
+	blackbear = 0,
+	brownbear = 0,
+	polarbear = 0,
+	slothbear = 0,
+	bear = 0,
+}
+
+-- 前后偏移（沿目标自身朝向，单位 studs，负值 = 往后退）。
+-- 熊现在用 spine_03/spine_02 中点定位，不需要人工前后偏移（全部 0）。
+local SPECIES_AIM_DZ = {
+	blackbear = 0,
+	brownbear = 0,
+	grizzlybear = 0,
+	grizzly = 0,
+	polarbear = 0,
+	slothbear = 0,
+	bear = 0,
+}
+
+-- 用身体 MeshPart 定位的物种（器官坐标会随骨骼摆动的）。
+local BODY_MESH_SPECIES = {
+	grizzlybear = true, grizzly = true, blackbear = true, brownbear = true,
+	polarbear = true, slothbear = true,
 }
 
 local function animalAimPoint(m)
@@ -2730,15 +2795,117 @@ local function animalAimPoint(m)
 		return root.CFrame * offH
 	end
 
+	-- 胸腔定位：胸椎（spine_03）与背椎（spine_02）的中点。
+	-- 实测 MaleMoose 的骨骼（相对 RootPart，沿 LookVector）：
+	--   Eyes +3.93 / neck +1.59 / 前腿起点 +1.71 / spine_03 +0.17 /
+	--   spine_02 -1.22 / spine_01 -2.48 / 后腿 -3.0~-4.6（后负为朝头）
+	-- 用户说的「肺在前腿靠后一点」= spine_03 与 spine_02 之间，中点约 -0.53。
+	-- 之前用的 LeftLung / RightLung 落在 +0.588（肩前 / 脖子根）——
+	-- 名字叫肺，位置根本不在肺上。
+	if BODY_MESH_SPECIES[speciesKey(m.Name)] then
+		-- 熊没有 spine_XX 骨骼（实测 GrizzlyBear 的 spine_01/02/03 全是 nil，
+		-- 和驼鹿不同构，不能照搬驼鹿那套命名）。
+		-- 但 LeftLung / RightLung / Heart 都在，实测（相对 RootPart，沿 LookVector）：
+		--   LeftLung  前后=-0.499  上下=+0.513
+		--   RightLung 前后=-0.500  上下=+0.514
+		--   Heart     前后=-0.502  上下=+0.123
+		-- 前后 -0.50 正是用户说的「前腿靠后一点」；但两肺本身偏上（+0.51），
+		-- 所以取「两肺中点」与「心脏」的中点 = 胸腔中心（前后 -0.50 / 上下 +0.32）。
+		-- 熊的 LeftLung / Heart 挂点不可信：实测两者前后都在 -0.50
+		-- （完全重合），而驼鹿的两肺在 -0.166、心在 -0.831（差 0.66）。
+		-- 照搬驼鹿那套会把点落在前腿前方（=肩/胸口），用户反馈的「定到胸口了」就是这个。
+		-- 改用**身体包围盒按比例**，比例从驼鹿实测反推：
+		--   FemaleMoose: bounds Size=(2.06,5.92,8.42)，两肺前后 -0.166 → (-0.166+4.21)/8.42 = 48.0%（从头往尾）
+		--                两肺上下 +0.834 → (0.834+2.96)/5.92 = 64.1%（从脚往上）
+		--   驼鹿前腿根 c_thigh_b = -0.367 (=45.6%)，肺 48.0% 正好在前腿后面 2.4%，和用户说的一致。
+		local pbB = m:FindFirstChild("_ProjectileBounds")
+		if pbB and pbB:IsA("BasePart") then
+			local L, U = root.CFrame.LookVector, root.CFrame.UpVector
+			local minF, maxF, minU, maxU = 1e9, -1e9, 1e9, -1e9
+			for _, s in ipairs({
+				Vector3.new(1, 1, 1), Vector3.new(1, 1, -1), Vector3.new(1, -1, 1), Vector3.new(1, -1, -1),
+				Vector3.new(-1, 1, 1), Vector3.new(-1, 1, -1), Vector3.new(-1, -1, 1), Vector3.new(-1, -1, -1),
+			}) do
+				local v = (pbB.CFrame * (pbB.Size * 0.5 * s)) - root.Position
+				local f, u = v:Dot(L), v:Dot(U)
+				if f < minF then minF = f end
+				if f > maxF then maxF = f end
+				if u < minU then minU = u end
+				if u > maxU then maxU = u end
+			end
+			if maxF - minF > 0.5 then
+				-- 48% 从头往尾、 64% 从脚往上
+				local f = minF + (maxF - minF) * 0.48
+				local u = minU + (maxU - minU) * 0.64
+				local raw = root.CFrame * Vector3.new(0, u, f)
+				local prev = organSmooth[m]
+				if prev then raw = prev:Lerp(raw, 0.40) end
+				organSmooth[m] = raw
+				return raw
+			end
+		end
+		local s3 = m:FindFirstChild("spine_03", true)
+		local s2 = m:FindFirstChild("spine_02", true)
+		if s3 and s2 and s3:IsA("Attachment") and s2:IsA("Attachment")
+			and s3.Parent and s2.Parent then
+			local mid = (s3.WorldPosition + s2.WorldPosition) * 0.5
+			-- 跟姿态但有一定惯性，避免骨骼微抖直接传到准星
+			local prev = organSmooth[m]
+			if prev then mid = prev:Lerp(mid, 0.40) end
+			organSmooth[m] = mid
+			return mid
+		end
+		-- 没有 spine 骨骼才退回身体 MeshPart 几何中心
+		local best, bestV = nil, 0
+		for _, p in ipairs(m:GetDescendants()) do
+			if p:IsA("BasePart") and p.Name ~= "RootPart" and p.Name ~= "_ProjectileBounds" and p.Name ~= "Eyes" then
+				local v = p.Size.X * p.Size.Y * p.Size.Z
+				if v > bestV then best, bestV = p, v end
+			end
+		end
+		if best then
+			return best.CFrame * Vector3.new(0, best.Size.Y * 0.08, 0)
+		end
+	end
+
+
+	-- 熊曾经改用包围盒比例定位，已撤销：那段写的 `Vector3.new(0, u, -f)` 带了个错误的负号，
+	-- f 本来就是沿 LookVector 的正值，再取反就把点翻到 RootPart 背后。
+	-- 实测 GrizzlyBear：肺在局部 +0.596（前）/ +0.657（上），而那段算出来是 -0.953（后）。
+	-- 现在直接用肺中点，不在错基准上叠加修正。
+
+	-- 器官坐标每帧重算，不信任缓存。
+	-- 肺挂在骨骼上，熊走路 / 低头时 spine 姿态一变，肺相对 RootPart 就移了，
+	-- 缓存的局部坐标还停在旧姿态 —— 用户实测：同一只熊刚才准、换个姿势就不准。
+	-- 现在每帧读真实世界坐标，再用 Lerp 平滑，既跟得上姿态又不抖（抖是当初缓存的原因）。
 	local off = organCache[m]
-	-- 高速移动的目标（飞行的鸟、奔跑中的兽）不信任缓存的局部偏移：
-	-- 那个偏移是第一次采样时用 root.CFrame 换算出来的，动画一变姿态
-	-- （鸟俯冲、兽低头）真实器官位置就跟着转了，缓存值还停在旧姿态上，
-	-- 结果是全程差一点点 —— 地面上慢慢走的动物感觉不出来，飞起来就差很多。
 	do
-		local r0 = m:FindFirstChild("RootPart")
-		local v0 = r0 and r0.AssemblyLinearVelocity
-		if v0 and v0.Magnitude > 15 then off = nil end
+		local refs = organRefs[m]
+		if not refs or not refs.ll or not refs.ll.Parent then
+			refs = {
+				ll = m:FindFirstChild("LeftLung", true),
+				rl = m:FindFirstChild("RightLung", true),
+				ht = m:FindFirstChild("Heart", true),
+			}
+			organRefs[m] = refs
+		end
+		local livePt
+		if refs.ll and refs.ll.Parent then
+			if refs.rl and refs.rl.Parent then
+				livePt = (refs.ll.WorldPosition + refs.rl.WorldPosition) * 0.5
+			else
+				livePt = refs.ll.WorldPosition
+			end
+		elseif refs.ht and refs.ht.Parent then
+			livePt = refs.ht.WorldPosition
+		end
+		if livePt then
+			local prev = organSmooth[m]
+			if prev then livePt = prev:Lerp(livePt, 0.55) end
+			organSmooth[m] = livePt
+			off = root.CFrame:PointToObjectSpace(livePt)
+			organCache[m] = off
+		end
 	end
 	if not off then
 		local ll = m:FindFirstChild("LeftLung", true)
@@ -2768,10 +2935,16 @@ local function animalAimPoint(m)
 	end
 	-- CFrame * Vector3 已经是世界坐标点（Vector3），不能再取 .Position
 	local pt = root.CFrame * off
-	local dy = SPECIES_AIM_DY[speciesKey(m.Name)]
+	local sk = speciesKey(m.Name)
+	local dy = SPECIES_AIM_DY[sk]
 	if dy then
 		-- 只有身体点需要修正；瞄头时那个眼/头骨骼本身就是准的
 		pt = pt + Vector3.new(0, dy, 0)
+	end
+	-- 前后：LookVector 是目标自身的正前方，负值就是往尾巴那边退
+	local dz = SPECIES_AIM_DZ and SPECIES_AIM_DZ[sk]
+	if dz then
+		pt = pt + root.CFrame.LookVector * dz
 	end
 	return pt
 end
@@ -2880,7 +3053,62 @@ local function pickBulletTarget(origin)
 end
 bt.pick = pickBulletTarget
 
+-- 开枪后的真实射线碰撞检测：从 origin 沿 dir 打一条 2000 格的 Raycast，
+-- 撞到哪个动物就记哪个。不再遍历 targets 算垂直距离（那种算法会把
+-- 射线旁边擦过、实际没碰到的动物也算成命中）。
+-- 开枪后 SHOT_WINDOW 秒内，每帧用「相机中心射线」碰撞检测：撞到目标就标「打中」。
+-- 用户明确要的判定方式：不看弹道、不看子追锁定、不看开火瞬间那一条线，
+-- 只看「开枪之后一小段时间里，我的准星射线碰到了谁」。
+local function checkShotRay()
+	if not lastShot or (os.clock() - lastShot.t) > SHOT_WINDOW then return end
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ign = {}
+	local ch = Players.LocalPlayer.Character
+	if ch then ign[#ign + 1] = ch end
+	-- 必须忽略相机：第一人称手里那把枪就贴在相机前面一格，
+	-- 不忽略的话射线第一个就撞到自己的 viewmodel 上。
+	ign[#ign + 1] = cam
+	-- 必须忽略 Barriers：这是游戏自带的无形碰撞墙，它挡得住 Raycast，
+	-- 但挡不住子弹（子弹走自定义弹道，不走物理碰撞）。
+	-- 实测：8 只动物里 7 只的射线在 173~520 格处撞到 Barrier，一只都记不上账。
+	local barriers = workspace:FindFirstChild("Barriers")
+	if barriers then ign[#ign + 1] = barriers end
+	params.FilterDescendantsInstances = ign
+	local ok, res = pcall(function()
+		return workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 2000, params)
+	end)
+	if not ok or not res or not res.Instance then
+		GENV.__MB = { t = os.clock(), stage = "miss", ok = ok }
+		return
+	end
+	-- 从命中的零件往上找，找到 targets 里登记过的 Model 就是它。
+	local node = res.Instance
+	local depth = 0
+	local chain = {}
+	while node and depth < 8 do
+		chain[#chain + 1] = node.Name
+		if targets[node] then
+			GENV.__MB = { t = os.clock(), stage = "hit", hit = res.Instance.Name, found = node.Name, depth = depth, chain = table.concat(chain, " < ") }
+			-- 记下 Id：尸体兜底机制靠它认领
+			local okId, tid = pcall(function() return node:GetAttribute("Id") end)
+			if okId and tid ~= nil then shotHitIds[tostring(tid)] = true end
+			markPending(node)
+			return
+		end
+		node = node.Parent
+		depth = depth + 1
+	end
+	GENV.__MB = { t = os.clock(), stage = "nottarget", hit = res.Instance.Name, chain = table.concat(chain, " < ") }
+end
+
 local function btFireHook(self, origin, dir, speed, ...)
+	-- 记录这次真实发射，供 raycastAnimal 判命中（子追开着或没开都记）
+	if typeof(origin) == "Vector3" and typeof(dir) == "Vector3" and dir.Magnitude > 0.01 then
+		lastShot = { origin = origin, dir = dir, t = os.clock() }
+	end
 	if not CFG.btrack or not bt.origFire then
 		return bt.origFire(self, origin, dir, speed, ...)
 	end
@@ -2897,7 +3125,7 @@ local function btFireHook(self, origin, dir, speed, ...)
 				local shift = vel * (travel * lead)
 				pt = pt + shift
 				-- 前 8 次开枪把实测值打出来，「提前量多了/少了」直接看数字调系数
-				if (bt.leadLog or 0) < 8 then
+				if (bt.leadLog or 0) < 40 then
 					bt.leadLog = (bt.leadLog or 0) + 1
 					print(string.format("[子追提前] %s 距=%dm 弹速=%.0f 飞行=%.3fs 目标速度=%.1f 偏移=%.2f studs (系数 %.2f)",
 						res.model.Name, math.floor(res.dist), speed, travel, vel.Magnitude, shift.Magnitude, lead))
@@ -2913,13 +3141,10 @@ local function btFireHook(self, origin, dir, speed, ...)
 			-- 目标立刻被当成「我的尸体」画上尸体标；而动物其实还活着，
 			-- 于是活体标和尸体标叠在同一只动物身上（用户看到的现象）。
 			-- markPending 只登记 Id + 时间戳，5 分钟内在 DeadAnimals / AnimalRagdoll 里真出现才算转正。
-			if res.model then
-				pcall(markPending, res.model)
-			end
 			return bt.origFire(self, origin, d.Unit, speed, ...)
 		end
-	elseif not ok then
-		bt.lastErr = tostring(res)
+	else
+		if not ok then bt.lastErr = tostring(res) end
 	end
 	return bt.origFire(self, origin, dir, speed, ...)
 end
@@ -3098,7 +3323,10 @@ local function btRender()
 end
 
 -- 默认不接管：只有 CFG.btrack 为 true 时才替换 caster.Fire
-if CFG.btrack then pcall(btInstall) end
+-- 无条件装：子追关着的时候也要能捕到真实开枪（手动扣扳机也走 caster.Fire），
+-- 否则 lastShot 不更新，markPending 的开枪检测会把真打中的也一起丢掉。
+-- btFireHook 里已有 `if not CFG.btrack ... return bt.origFire(...)` 分支，子追关时只记录、不干预弹道。
+pcall(btInstall)
 bt._targetsRef = targets
 bt._cfgRef = CFG
 bt._aimPoint = btAimPoint
@@ -3188,7 +3416,9 @@ if UHD then
 		local head = (hrp.Parent and hrp.Parent:FindFirstChild("Head")) or hrp
 		local dir = (t.PrimaryPart.Position - head.Position).Unit
 		pcall(function() UHD:FireServer(dir) end)
-		markPending(t)           -- 只登记候选，等尸体真的出现才转正（直接 rememberKill 会把打不死的也标绿）
+		-- 不在这里记账：headSync 是按住左键时每 0.2 秒跑一次的，
+		-- 把 aim.target（=就是连线锁定的那只）反复登记成「开火候选」，
+		-- 别人打死它也会被认成我打中的（用户反馈的标蓝）。
 		aim.synced = (aim.synced or 0) + 1
 	end)
 else
@@ -3412,11 +3642,28 @@ GENV.__DAWG_GEN = (tonumber(GENV.__DAWG_GEN) or 0) + 1
 local MY_GEN = GENV.__DAWG_GEN
 
 connSync = RunService.Heartbeat:Connect(function(dt)
+	-- 开枪窗口：开枪后 1 秒内每帧做一次相机射线碰撞检测。
+	pcall(checkShotRay)
+	-- 额外尸体检查：每 CARCASS_SWEEP 秒跑一次
+	carcassAcc = carcassAcc + dt
+	if carcassAcc >= CARCASS_SWEEP then
+		carcassAcc = 0
+		pcall(sweepCarcasses)
+	end
 	if GENV.__DAWG_GEN ~= MY_GEN then
 		pcall(function() connSync:Disconnect() end)
 		connSync = nil
 		if headConn then pcall(function() headConn:Disconnect() end) headConn = nil end
 		return
+	end
+	-- 每帧给速度跟踪器喂样本。
+	-- 之前只在 btFireHook 里调用 bodyVelocity（=只在开枪那一刻采样），
+	-- 两次开枪相隔好几秒，差分算出来的是「这几秒的平均速度」：
+	-- 目标从慢走加速到奔跑时，平均值远低于开枪那一刻的真实速度，
+	-- 提前量就系统性偏少（用户反馈「奔跑的时候预判还是少了」）。
+	-- 放到 Heartbeat 里每帧采一次，开枪时 rec.t 只差 16ms，算的就是瞬时速度。
+	for m in pairs(targets) do
+		pcall(bodyVelocity, m)
 	end
 	accSync = accSync + dt
 	if accSync >= CFG.refresh then
@@ -3543,6 +3790,10 @@ local function buildFluent()
 		sb1:AddToggle("btHead", { Title = "瞄准头部（关=身体）", Default = (CFG.btrackAimPart == "head"),
 			Callback = function(v) CFG.btrackAimPart = v and "head" or "body" end })
 		sb1:AddToggle("btText", { Title = "显示目标文字", Default = CFG.btrackText, Callback = function(v) CFG.btrackText = v end })
+		-- 提前量倍数：1.0 = 按「距离/弹速」完整预判。奔跑目标还是打在后面就往上拉。
+		sb1:AddSlider("btLead", { Title = "提前量(%)", Default = math.floor((CFG.btrackLead or 1) * 100 + 0.5),
+			Min = 0, Max = 300, Rounding = 0,
+			Callback = function(v) CFG.btrackLead = (tonumber(v) or 100) / 100 end })
 
 		local t3 = w:AddTab({ Title = "操作", Icon = "wrench" })
 		local s3 = t3:AddSection("快捷")
@@ -3596,6 +3847,7 @@ if not GENV.__DAWG_NO_UI then
 			CFG.btrackAimPart = v and "head" or "body"
 		end)
 		ui:toggle("显示目标文字", CFG.btrackText, function(v) CFG.btrackText = v end)
+		ui:stepper("提前量", 0, 3, 0.1, CFG.btrackLead, function(v) CFG.btrackLead = v end)
 		ui:button(bt.patched and "子追状态：Caster 已接管" or ("子追未接管: " .. tostring(bt.lastErr or "无")), function()
 			print(string.format("[狩猎ESP] 子追: patched=%s 开枪=%d 已瞄准=%d 最后=%s 错误=%s",
 				tostring(bt.patched), bt.shots, bt.aimed,
@@ -3778,23 +4030,64 @@ do
 		setPanel(false)
 	end)
 
-	local holder = uiHolder()
+	-- 悬浮球必须「一定看得见」：移动端 gethui() 常返回隐藏容器（反检测用），
+	-- ScreenGui 挂进去虽然 Parent 正常，但屏幕上什么都不显示。
+	-- 所以这里优先用真正会渲染的容器：CoreGui → PlayerGui → gethui() 兜底。
+	local holder
+	do
+		local function writable(c)
+			if not c then return false end
+			local ok = pcall(function()
+				local probe = Instance.new("Folder")
+				probe.Parent = c
+				probe:Destroy()
+			end)
+			return ok
+		end
+		local cg = game:GetService("CoreGui")
+		local lp = Players.LocalPlayer
+		local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
+		if writable(cg) then
+			holder = cg
+		elseif writable(pg) then
+			holder = pg
+		else
+			holder = uiHolder()
+		end
+	end
+
+	-- 换容器时把旧的搬过来（重载不会出现两个球，也不会因为换了容器就消失）
+	local oldGui
+	for _, c in ipairs({ game:GetService("CoreGui"), uiHolder() }) do
+		pcall(function()
+			local g = c:FindFirstChild("DawgHuntFloat")
+			if g and g ~= oldGui then oldGui = g end
+		end)
+	end
 	floatGui = holder:FindFirstChild("DawgHuntFloat")
+	if not floatGui and oldGui then
+		floatGui = oldGui
+		pcall(function() floatGui.Parent = holder end)
+	end
 	if not floatGui then
 		floatGui = Kit.new("ScreenGui", {
 			Name = "DawgHuntFloat",
 			ResetOnSpawn = false,
-			DisplayOrder = 10000,
+			DisplayOrder = 20000,
 			IgnoreGuiInset = true,
+			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+			Enabled = true,
 		}, holder)
 	end
+	-- 强制可见（有些执行器会继承容器的隐藏状态）
+	pcall(function() floatGui.Enabled = true end)
 	local saved = GENV.__NINJA_BTN_POS
 	floatBtn = floatGui:FindFirstChild("Toggle")
 	if not floatBtn then
 		floatBtn = Kit.new("TextButton", {
 			Name = "Toggle",
 			Size = UDim2.fromOffset(56, 56),
-			Position = (type(saved) == "UDim2") and saved or UDim2.new(1, -76, 1, -136),
+			Position = (type(saved) == "UDim2") and saved or UDim2.new(1, -76, 0, 96),
 			AnchorPoint = Vector2.new(0, 0),
 			BackgroundColor3 = Color3.fromRGB(28, 30, 38),
 			BackgroundTransparency = 0.15,
@@ -3837,6 +4130,14 @@ do
 				startPos.Y.Scale, startPos.Y.Offset + d.Y)
 		end
 	end)
+	pcall(function()
+		print(string.format("[悬浮球] 容器=%s Enabled=%s 位置=%s 尺寸=%s",
+			tostring(floatGui.Parent and floatGui.Parent:GetFullName()),
+			tostring(floatGui.Enabled),
+			tostring(floatBtn.Position),
+			tostring(floatBtn.Size)))
+	end)
+
 	floatBtn.InputEnded:Connect(function(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1
 			and input.UserInputType ~= Enum.UserInputType.Touch then return end
