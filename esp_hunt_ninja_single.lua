@@ -2157,13 +2157,52 @@ end
 -- 表现就是"有时候好好的，重载一次就变卡变傻"。这游戏实测 level=none（338 个脚本 0 命中）。
 local acPolicy = { maxSendHz = 10, allowNamecallHook = true }
 
-local holder = uiHolder()
+-- 视觉容器必须「一定渲染」：uiHolder() 在 Potassium 上返回 CoreGui.RobloxGui，
+-- 那是 Roblox 自己的 GUI 层，第三方 Highlight / BillboardGui / ScreenGui 挂进去
+-- 在移动端屏幕上什么都不画（Parent 正常、Enabled 正常，就是看不见）。
+-- 所以这里绕开 uiHolder()，优先用真正会渲染的 CoreGui → PlayerGui。
+local holder
+do
+	local function writable(c)
+		if not c then return false end
+		local ok = pcall(function()
+			local probe = Instance.new("Folder")
+			probe.Parent = c
+			probe:Destroy()
+		end)
+		return ok
+	end
+	local cg = game:GetService("CoreGui")
+	local lp = Players.LocalPlayer
+	local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
+	if writable(cg) then
+		holder = cg
+	elseif writable(pg) then
+		holder = pg
+	else
+		holder = uiHolder()
+	end
+end
+
 -- 重载策略：不销毁、不重建，直接接管旧容器。
 -- 理由：销毁 → 重建之间有一帧空窗（动物标记全闪一下），而且旧引用一旦丢在场景里就会越叠越多。
 -- 改成「有就复用、没有才建」，重载等于把新逻辑盖到同一套实例上，视觉上零中断。
 local folder = holder:FindFirstChild("DawgHuntESP")
 if not folder or not folder:IsA("Folder") then
-	folder = Kit.new("Folder", { Name = "DawgHuntESP" }, holder)
+	-- 旧容器可能还挂在 gethui 的隐藏层里，先搬过来再复用（不然会建出第二套，旧高亮留在不可见层）
+	local stale
+	for _, c in ipairs({ game:GetService("CoreGui"), uiHolder() }) do
+		pcall(function()
+			local g = c:FindFirstChild("DawgHuntESP")
+			if g and g:IsA("Folder") and g ~= stale then stale = g end
+		end)
+	end
+	if stale then
+		folder = stale
+		pcall(function() folder.Parent = holder end)
+	else
+		folder = Kit.new("Folder", { Name = "DawgHuntESP" }, holder)
+	end
 end
 
 
@@ -2240,11 +2279,28 @@ end
 local lastShot = nil
 -- 发射后多少秒之内算「这一枪是我打的」。
 -- 3446 studs/s 的弹速飞 2000 格要 0.58 秒，留一倍余量。
-local SHOT_WINDOW = 1.0
+local SHOT_WINDOW = 1.5   -- 开枪后多久内算「这一枪是我打的」（子弹飞到 1600 格约 0.5 秒，留余量）
+
+-- 尸体认领窗口：只靠「开火输入」触发，不依赖 ProjectileCaster hook。
+-- btrack 关闭时 Fire 没被 hook，lastShot 永远是 nil，
+-- markPending / shotHitIds / sweepCarcasses 整条链全空 —— 所以需要这条独立通道。
+-- 平板走 Touch，PC 走 MouseButton1，两个都接。
+-- dir 是开火那一刻的准星朝向：别人打的动物一般不在我的射击方向上，
+-- 靠这个锥形判据把「同范围内别人打死的」剔掉。
+local claimWindow = { deadlineAt = 0, origin = nil, dir = nil }
+local CLAIM_WINDOW = 15     -- 秒：开火后多久内出现的尸体算（再长会开始收别人打的）
+local CLAIM_RADIUS = 2500   -- 格：尸体距离开火位置多远内算（实测击杀距离 1600+）
+local CLAIM_ANGLE = 22      -- 度：尸体必须在开火朝向的这个锥内，否则视为别人打的
+getgenv().__CLAIM = claimWindow   -- 诊断用：外部可读当前窗口状态
 
 -- 额外尸体兜底用的「我射线撞到过」集合：按 Id 字符串永久记。
 -- 和 pendingKills 的区别就在这里 —— pendingKills 挂的是模型引用，
 -- 模型被销毁 / 换实例就没了；这里按 Id 记，尸体换个实例也认得回来。
+-- 最近一次开火的时间（Unix 秒）。尸体属性 BleedsOutAt 也是 Unix 秒，
+-- 两者能直接比较：BleedsOutAt 落在我开火之后的流血窗口内 → 是我打死的。
+local lastFireTime = 0
+local BLEED_TOLERANCE = 45   -- 秒：中枪到流血致死最长容差
+
 local shotHitIds = getgenv().__DAWG_SHOT_HIT_IDS
 if type(shotHitIds) ~= "table" then
 	shotHitIds = {}
@@ -2266,7 +2322,9 @@ local function markPending(model)
 	-- 开枪检测：最近 SHOT_WINDOW 秒内没有真实发射，说明这一枪不是我打的，直接丢掉。
 	-- 用户反馈「FOV 内别人打的还是会算给我」—— 之前 markPending 只看「目标在不在准星附近」，
 	-- 我根本没开枪，邻居把目标打死也会被记成我的候选。
-	if not lastShot or (os.clock() - lastShot.t) > SHOT_WINDOW then return end
+	local nowT = os.clock()
+	-- 只认真实发射（hook 生效时）。尸体归属主要由 sweepNearbyCarcasses 独立负责。
+	if not (lastShot and (nowT - lastShot.t) <= SHOT_WINDOW) then return end
 	local ok, id = pcall(function() return model:GetAttribute("Id") end)
 	if ok and id ~= nil then
 		-- 候选不设过期时间：记下模型引用，等它真的变成尸体再转正。
@@ -2284,6 +2342,41 @@ local function rememberKill(model)
 		myKills[tostring(id)] = true
 	end
 end
+
+-- 独立开火检测：按下左键/触摸就把「相机位置 + 朝向」记进 lastShot，
+-- 让 checkShotRay 能在接下来 SHOT_WINDOW 秒内每帧发射线判命中。
+-- 不依赖 ProjectileCaster hook（btrack 关着也有），否则永远记不到「我打过」。
+local aimShotConn = UIS.InputBegan:Connect(function(input)
+	local ut = input.UserInputType
+	if ut ~= Enum.UserInputType.MouseButton1 and ut ~= Enum.UserInputType.Touch then return end
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	lastShot = { origin = cam.CFrame.Position, dir = cam.CFrame.LookVector, t = os.clock() }
+	-- 记开火时间（Unix 秒），用来和尸体的 BleedsOutAt 对齐
+	lastFireTime = os.time()
+end)
+
+-- 左键按下就开认领窗口（独立通道，不依赖 ProjectileCaster hook）
+-- 平板：Enum.UserInputType.Touch；PC：MouseButton1。两个都接。
+local claimConn = UIS.InputBegan:Connect(function(input)
+	local ut = input.UserInputType
+	if ut ~= Enum.UserInputType.MouseButton1 and ut ~= Enum.UserInputType.Touch then return end
+	local nowT = os.clock()
+	if nowT > claimWindow.deadlineAt then
+		local ch = Players.LocalPlayer.Character
+		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			claimWindow.origin = hrp.Position
+		else
+			local cam = workspace.CurrentCamera
+			claimWindow.origin = cam and cam.CFrame.Position or nil
+		end
+		-- 每次都更新朝向（连发时方向可能微调），原点只在窗口重新开启时刷新
+		local cam0 = workspace.CurrentCamera
+		claimWindow.dir = cam0 and cam0.CFrame.LookVector or nil
+	end
+	claimWindow.deadlineAt = nowT + CLAIM_WINDOW
+end)
 
 -- 开火瞬间就记账：不依赖「锁定目标」（手动瞄准时 aim.target 是 nil，一枪死的动物根本记不上）。
 -- 一次点击可能打死多只（霰弹），所以把准星附近的都记进来。
@@ -2498,8 +2591,10 @@ local function sweepCarcasses()
 		local ok, id = pcall(function() return m:GetAttribute("Id") end)
 		if not ok or id == nil then return end
 		local idStr = tostring(id)
-		if not shotHitIds[idStr] then return end
 		if myKills[idStr] and myKillModels[m] then return end
+		-- 只认射线记过账的（btrack 开着时才有效）。
+		-- 「玩家周围 1600 内就算我打的」由 sweepNearbyCarcasses 单独负责，这里不重复。
+		if shotHitIds[idStr] ~= true then return end
 		myKills[idStr] = true
 		myKillModels[m] = true
 		hit = hit + 1
@@ -2510,6 +2605,67 @@ local function sweepCarcasses()
 		for _, m in ipairs(dead:GetChildren()) do try(m) end
 	end
 	GENV.__SWEEP = { t = os.clock(), hit = hit, ids = (function() local n = 0 for _ in pairs(shotHitIds) do n = n + 1 end return n end)() }
+end
+
+-- 独立尸体扫描：每 3 秒跑一次，不用开火事件触发。
+-- 判据：① 我的射线真的打中过它（shotHitIds）② 在玩家周围 NEARBY_RADIUS 内 ③ 还没标记过。
+-- 已经标过的直接跳过（myKills + myKillModels 都有就是标过）。
+local NEARBY_RADIUS = 1600
+local function sweepNearbyCarcasses()
+	local lp = Players.LocalPlayer
+	local ch = lp and lp.Character
+	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+	if not hrp then return 0 end
+	local origin = hrp.Position
+	local hit = 0
+
+	local function try(m)
+		if not m or not m:IsA("Model") or not m.Parent then return end
+		local ok, id = pcall(function() return m:GetAttribute("Id") end)
+		if not ok or id == nil then return end
+		local idStr = tostring(id)
+		-- 已经标记过的不动
+		if myKills[idStr] and myKillModels[m] then return end
+
+		local accepted = false
+		-- 判据一（强证据）：射线真的打中过它
+		if shotHitIds[idStr] == true then
+			accepted = true
+		end
+		-- 判据二：BleedsOutAt（服务端写的死亡时间）落在我最后一次开火之后的流血窗口内。
+		-- 别人打死的动物 BleedsOutAt 对应的是别人开枪的时间，对不上我的。
+		if not accepted and lastFireTime > 0 then
+			local okB, bleeds = pcall(function() return m:GetAttribute("BleedsOutAt") end)
+			if okB and type(bleeds) == "number" then
+				-- BleedsOutAt 是最多 BLEED_TOLERANCE 秒之前中枪造成的
+				if bleeds >= (lastFireTime - BLEED_TOLERANCE) and bleeds <= (os.time() + 5) then
+					accepted = true
+				end
+			end
+		end
+		if not accepted then return end
+
+		-- 距离兜底：必须在玩家附近
+		local pos = m.PrimaryPart and m.PrimaryPart.Position
+		if not pos then
+			local okP, pv = pcall(function() return m:GetPivot().Position end)
+			if okP then pos = pv end
+		end
+		if not pos then return end
+		if (pos - origin).Magnitude > NEARBY_RADIUS then return end
+
+		myKills[idStr] = true
+		myKillModels[m] = true
+		hit = hit + 1
+	end
+
+	for _, m in ipairs(CollectionService:GetTagged("AnimalRagdoll")) do try(m) end
+	local dead = workspace:FindFirstChild("DeadAnimals")
+	if dead then
+		for _, m in ipairs(dead:GetChildren()) do try(m) end
+	end
+	GENV.__NEARBY = { t = os.clock(), hit = hit, radius = NEARBY_RADIUS }
+	return hit
 end
 
 -- 每只动物的唯一 key：优先 Id 属性（形如 1795353705360-1e7495f7-...-0，每只都不同），
@@ -3649,6 +3805,8 @@ connSync = RunService.Heartbeat:Connect(function(dt)
 	if carcassAcc >= CARCASS_SWEEP then
 		carcassAcc = 0
 		pcall(sweepCarcasses)
+		-- 独立认领：以玩家为中心 NEARBY_RADIUS 内、未标记过的尸体
+		pcall(sweepNearbyCarcasses)
 	end
 	if GENV.__DAWG_GEN ~= MY_GEN then
 		pcall(function() connSync:Disconnect() end)
