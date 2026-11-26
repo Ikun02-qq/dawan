@@ -2279,11 +2279,14 @@ end
 -- ② 每秒扫描尸体：没高亮 且 shotHitIds 里有 → 套高亮
 -- 旧的 pendingKills / claimWindow / SHOT_WINDOW / BleedsOutAt 判定已全部移除。
 
+-- 打中记录：Id → os.clock() 时间戳（不是 true，否则标签会永久挂着）
 local shotHitIds = getgenv().__DAWG_SHOT_HIT_IDS
 if type(shotHitIds) ~= "table" then
 	shotHitIds = {}
 	getgenv().__DAWG_SHOT_HIT_IDS = shotHitIds
 end
+local HIT_TAG_TTL = 15       -- 秒：「（打中）」标签显示多久，过期自动消失
+local HIT_CLAIM_TTL = 300    -- 秒：尸体认领的有效期（动物可能跑几分钟才倒）
 
 -- 保留空壳：headConn 等旧位置仍在调它，避免改一处漏一处
 local function markPending(model)
@@ -2303,15 +2306,35 @@ end
 -- pcall(nil) 静默失败 → 打中检测永远不执行（这个坑已经踩过 K104）。
 local checkShotRay
 
--- 独立开火检测：按下左键/触摸就把「相机位置 + 朝向」记进 lastShot，
--- 让 checkShotRay 能在接下来 SHOT_WINDOW 秒内每帧发射线判命中。
--- 不依赖 ProjectileCaster hook（btrack 关着也有），否则永远记不到「我打过」。
-local aimShotConn = UIS.InputBegan:Connect(function(input)
-	local ut = input.UserInputType
-	if ut ~= Enum.UserInputType.MouseButton1 and ut ~= Enum.UserInputType.Touch then return end
-	-- 扣扳机这一刻直接判一次命中，不做延迟窗口
-	pcall(checkShotRay)
-end)
+-- 开火触发：只认真实开火，不认触摸/鼠标按键。
+-- 为什么不能用 InputBegan：平板转视角、点空白都会触发 Touch 的 InputBegan，
+-- 结果「没开枪也记成打中」（实测踩过）。
+-- ProjectileFire 是游戏自己的开火广播，只有真的扣扳机才会发。
+local fireSignalBound = false
+local function bindFireSignal()
+	if fireSignalBound then return end
+	local rs = game:GetService("ReplicatedStorage")
+	local remotes = rs:FindFirstChild("Remotes")
+	local pfire = remotes and remotes:FindFirstChild("ProjectileFire")
+	if not pfire then return end
+	fireSignalBound = true
+	-- 服务器广播（本机开火也会收到）
+	pcall(function()
+		pfire.OnClientEvent:Connect(function()
+			pcall(checkShotRay)
+		end)
+	end)
+	-- 自己发出去的开火（有些实现不走 OnClientEvent 回声）
+	pcall(function()
+		local oldFS = pfire.FireServer
+		pfire.FireServer = function(self, ...)
+			pcall(checkShotRay)
+			return oldFS(self, ...)
+		end
+	end)
+end
+bindFireSignal()
+task.delay(3, bindFireSignal)
 
 -- 开火瞬间就记账：不依赖「锁定目标」（手动瞄准时 aim.target 是 nil，一枪死的动物根本记不上）。
 -- 一次点击可能打死多只（霰弹），所以把准星附近的都记进来。
@@ -2497,9 +2520,13 @@ local function sweepCarcasses()
 		if not ok or id == nil then return end
 		local idStr = tostring(id)
 		if myKills[idStr] and myKillModels[m] then return end
-		-- 只认射线记过账的（btrack 开着时才有效）。
-		-- 「玩家周围 1600 内就算我打的」由 sweepNearbyCarcasses 单独负责，这里不重复。
-		if shotHitIds[idStr] ~= true then return end
+		-- 只认射线记过账的，按 HIT_CLAIM_TTL 判过期
+		local rec = shotHitIds[idStr]
+		if rec == nil then return end
+		if type(rec) == "number" and (os.clock() - rec) > HIT_CLAIM_TTL then
+			shotHitIds[idStr] = nil
+			return
+		end
 		myKills[idStr] = true
 		myKillModels[m] = true
 		hit = hit + 1
@@ -2532,10 +2559,13 @@ local function sweepNearbyCarcasses()
 		-- 已经标记过的不动
 		if myKills[idStr] and myKillModels[m] then return end
 
-		-- 唯一判据：我的射线真的打中过它（checkShotRay 记进 shotHitIds）。
-		-- 别人打死的尸体不会有这条记录，所以不会被误标。
-		-- 已移除 BleedsOutAt 时间窗判据。
-		if shotHitIds[idStr] ~= true then return end
+		-- 唯一判据：我的射线真的打中过它（按 HIT_CLAIM_TTL 判过期）
+		local rec = shotHitIds[idStr]
+		if rec == nil then return end
+		if type(rec) == "number" and (os.clock() - rec) > HIT_CLAIM_TTL then
+			shotHitIds[idStr] = nil
+			return
+		end
 
 		-- 距离兜底：必须在玩家附近
 		local pos = m.PrimaryPart and m.PrimaryPart.Position
@@ -2558,6 +2588,60 @@ local function sweepNearbyCarcasses()
 	end
 	GENV.__NEARBY = { t = os.clock(), hit = hit, radius = NEARBY_RADIUS }
 	return hit
+end
+
+-- 事件驱动兜底：尸体可能存活不到 1 秒（一枪致死后立刻被清理/移走），
+-- 光靠每秒轮询会漏。这里监听 AnimalRagdoll 标签的出现信号，瞬间抓。
+-- 同时监听 Animals 的子项移除：动物从活体列表消失的那一刻就检查是不是我打死的。
+local function claimOne(m)
+	if not m or not m:IsA("Model") or not m.Parent then return false end
+	local ok, id = pcall(function() return m:GetAttribute("Id") end)
+	if not ok or id == nil then return false end
+	local idStr = tostring(id)
+	if myKills[idStr] and myKillModels[m] then return true end
+	local rec = shotHitIds[idStr]
+	if rec == nil then return false end
+	if type(rec) == "number" and (os.clock() - rec) > HIT_CLAIM_TTL then
+		shotHitIds[idStr] = nil
+		return false
+	end
+	myKills[idStr] = true
+	myKillModels[m] = true
+	GENV.__CLAIM_HIT = (GENV.__CLAIM_HIT or 0) + 1
+	return true
+end
+
+do
+	local CS = game:GetService("CollectionService")
+	-- 尸体标签一出现就抓（比轮询快，能抓住存活很短的尸体）
+	pcall(function()
+		CS:GetInstanceAddedSignal("AnimalRagdoll"):Connect(function(m)
+			task.defer(function()
+				pcall(claimOne, m)
+			end)
+		end)
+	end)
+	-- 活体从 Animals 移除的那一刻：先记 Id（尸体可能晚一步或直接消失）
+	pcall(function()
+		local an = workspace:FindFirstChild("Animals")
+		if an then
+			an.ChildRemoved:Connect(function(m)
+				if m:IsA("Model") then
+					local ok, id = pcall(function() return m:GetAttribute("Id") end)
+					if ok and id ~= nil then
+						local idStr = tostring(id)
+						-- 只要射线记过账，就先标成我的（尸体出现后 sweep 会补上高亮）
+						local rec = shotHitIds[idStr]
+						if rec ~= nil and not (myKills[idStr] and myKillModels[m]) then
+							myKills[idStr] = true
+							myKillModels[m] = true
+							GENV.__CLAIM_REMOVED = (GENV.__CLAIM_REMOVED or 0) + 1
+						end
+					end
+				end
+			end)
+		end
+	end)
 end
 
 -- 手动补标：把玩家附近 NEARBY_RADIUS 内所有还没高亮的尸体，不管有没有射线记录全标上。
@@ -2584,7 +2668,7 @@ local function claimNearbyForce()
 		if (pos - origin).Magnitude > NEARBY_RADIUS then return end
 		myKills[idStr] = true
 		myKillModels[m] = true
-		shotHitIds[idStr] = true
+		shotHitIds[idStr] = os.clock()
 		hit = hit + 1
 	end
 	for _, m in ipairs(CollectionService:GetTagged("AnimalRagdoll")) do try(m) end
@@ -2719,11 +2803,17 @@ local function sync()
 		-- 活体：跳过已经是尸体的，否则会被刷回原样式
 		for _, m in ipairs(collectAnimals()) do
 			if not carcassSet[m] then
-				-- 打中但还没死：深蓝色标出来（射线打中过就算）
+				-- 打中但还没死：深蓝色标出来（HIT_TAG_TTL 秒内有效）
 				local hit = false
 				local okId, id = pcall(function() return m:GetAttribute("Id") end)
 				if okId and id ~= nil then
-					if shotHitIds[tostring(id)] == true then hit = true end
+					local rec = shotHitIds[tostring(id)]
+					if rec == true then
+						-- 兼容旧版存 true 的记录：直接清掉，让它自然过期
+						shotHitIds[tostring(id)] = nil
+					elseif type(rec) == "number" and (os.clock() - rec) < HIT_TAG_TTL then
+						hit = true
+					end
 				end
 				if hit then
 					take(m, PALETTE.hit, localName(m) .. "（打中）")
@@ -3189,7 +3279,7 @@ function checkShotRay()
 			GENV.__MB = { t = os.clock(), stage = "hit", hit = res.Instance.Name, found = node.Name, depth = depth, chain = table.concat(chain, " < ") }
 			-- 记下 Id：尸体兜底机制靠它认领
 			local okId, tid = pcall(function() return node:GetAttribute("Id") end)
-			if okId and tid ~= nil then shotHitIds[tostring(tid)] = true end
+			if okId and tid ~= nil then shotHitIds[tostring(tid)] = os.clock() end
 			markPending(node)
 			return
 		end
@@ -3198,6 +3288,48 @@ function checkShotRay()
 	end
 	GENV.__MB = { t = os.clock(), stage = "nottarget", hit = res.Instance.Name, chain = table.concat(chain, " < ") }
 end
+
+-- ============ 真实子弹命中：ProjectileHit（最可靠的判据） ============
+-- ProjectileCaster.ProjectileHit 是子弹真正打到东西时的处理函数，参数是 RaycastResult。
+-- 实测：res.Instance 是 _ProjectileBounds，往上爬一层 Parent 就是动物 Model。
+-- 它不依赖相机朝向、也不用管动物是否已经被移走 —— 物理上打到了就一定触发。
+local function onProjectileHit(res)
+	if not res or not res.Instance then return end
+	local node = res.Instance
+	local depth = 0
+	while node and depth < 6 do
+		if targets[node] then
+			local ok, id = pcall(function() return node:GetAttribute("Id") end)
+			if ok and id ~= nil then
+				shotHitIds[tostring(id)] = os.clock()
+				GENV.__MB = { t = os.clock(), stage = "proj", found = node.Name }
+				GENV.__PROJ_HITS = (GENV.__PROJ_HITS or 0) + 1
+			end
+			return
+		end
+		node = node.Parent
+		depth = depth + 1
+	end
+	GENV.__PROJ_MISS = (GENV.__PROJ_MISS or 0) + 1
+end
+
+local projHitInstalled = false
+local function installProjectileHit()
+	if projHitInstalled then return true end
+	local c = findCaster()
+	if not c then return false end
+	local orig = rawget(c, "ProjectileHit")
+	if type(orig) ~= "function" then return false end
+	c.ProjectileHit = function(self, res, ...)
+		pcall(onProjectileHit, res)
+		return orig(self, res, ...)
+	end
+	projHitInstalled = true
+	return true
+end
+installProjectileHit()
+task.delay(2, installProjectileHit)
+task.delay(6, installProjectileHit)
 
 local function btFireHook(self, origin, dir, speed, ...)
 	if not CFG.btrack or not bt.origFire then
@@ -3376,7 +3508,10 @@ local function btRender()
 		-- （UI / System / Plex / Monospace）全都不含中文字形，中文一律渲染成问号。
 		-- 改成 ScreenGui 里的 TextLabel —— 跟 BillboardGui 标签同一套字体引擎，中文正常。
 		if not btDraw.label or not btDraw.label.Parent then
-			local h = uiHolder()
+			-- 必须用 holder（CoreGui 根）：uiHolder() 返回 CoreGui.RobloxGui，
+			-- 那是 Roblox 自己的 GUI 层，ScreenGui 挂进去不渲染，
+			-- 结果就是「子追的目标文字/锁定线看不见」。
+			local h = holder
 			local sg = h:FindFirstChild("DawgHuntOverlay")
 			if not sg then
 				sg = Kit.new("ScreenGui", {
@@ -3458,7 +3593,7 @@ local aim = {
 	holdOnly = true,     -- 默认按住右键才生效，平时不抢视角
 	strength = 0.55,     -- 每帧插值系数（60fps 基准）
 	range = 1200,
-	ringRadius = 120,    -- 准星圈半径（屏幕像素）：圈内才锁，开镜不变
+	ringRadius = 120,    -- 已废弃：圈与判定统一用 CFG.btrackFov，这里只留兼容
 	ringVisible = true,  -- 显示准星圈（用户明确要留着，别动）
 	height = 0.6,        -- 兜底抬高（studs），量不出模型高度时才用
 	heightRatio = 0.55,  -- 目标点占模型高度的比例（0.5 = 躯干中线），不同体型自适应
@@ -3570,9 +3705,10 @@ local function pickAimTarget()
 	local camPos = cam.CFrame.Position
 	local vp = cam.ViewportSize
 	local cx, cy = vp.X / 2, vp.Y / 2
-	-- 锁定半径必须和画出来的圈一致，否则会出现「圈只有 120px、判定却是 300px」
-	-- 这种看着明显不对的情况（反过来也一样）。
-	local radius = aim.ringRadius
+	-- 锁定半径必须和画出来的圈一致，也要和子追判定一致，否则会出现
+	-- 「圈画 120px、实际能锁 300px」这种看着明显不对的情况。
+	-- 唯一真源：CFG.btrackFov（面板「准星圈大小」改的就是它）
+	local radius = CFG.btrackFov
 	local best, bestScore = nil, -math.huge
 	for model in pairs(targets) do
 		local part = model.PrimaryPart
@@ -3989,9 +4125,9 @@ updateRing = function()
 	ring.Visible = aim.ringVisible
 	if aimDot then aimDot.Visible = aim.ringVisible end
 	if not ring.Visible then return end
-	-- 圈的半径必须等于吸附判定用的 aim.ringRadius，否则会出现
-	-- 「画出来 300px、实际只在 120px 内锁」这种看着明显不对的情况
-	local r = aim.ringRadius
+	-- 圈的半径必须等于判定用的 CFG.btrackFov，否则会出现
+	-- 「画出来 120px、实际能锁 300px」这种看着明显不对的情况
+	local r = CFG.btrackFov
 	ring.Size = UDim2.fromOffset(math.floor(r * 2), math.floor(r * 2))
 end
 
